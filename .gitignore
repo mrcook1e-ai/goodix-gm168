@@ -1,0 +1,26 @@
+# --- PSK / secrets (never commit) -------------------------------------
+psk*.bin
+sealed*.bin
+*.psk
+*-backup-*.bin
+logs/
+
+# --- research/scratch (huge, machine-specific) ------------------------
+scratch/
+_fetched/
+*.bndb
+*.bndb.tmp
+data/
+
+# --- build / editor / OS junk -----------------------------------------
+build/
+*.o
+*.so
+*.so.*
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.swp
+.DS_Store
+Thumbs.db
