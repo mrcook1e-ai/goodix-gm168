@@ -107,7 +107,34 @@ def main():
     usb.util.claim_interface(dev, intf.bInterfaceNumber)
     print(f"[probe]   claimed interface {intf.bInterfaceNumber}")
 
+    def tx(label, pkt, drain_rx=True):
+        print(f"[probe] TX {label} ({len(pkt)} bytes): {hexdump_short(pkt)}")
+        dev.write(EP_OUT, pkt, TIMEOUT_MS)
+        if drain_rx:
+            try:
+                r = bytes(dev.read(EP_IN, 16 * 1024, TIMEOUT_MS))
+                print(f"        RX {len(r)} bytes: {hexdump_short(r)}")
+                return r
+            except usb.core.USBError as e:
+                print(f"        RX timeout: {e}")
+                return None
+        return None
+
     try:
+        # Sensor needs the same init prologue our driver runs in dev_activate
+        # before it will respond to cmd 0xE4. Without these, EP_IN stays silent.
+        # See INIT_WAKEUP → INIT_RESET → INIT_VERSION in goodix_gm168.c.
+        import time
+
+        tx("WAKEUP (cmd 0x11)", encode_a0_cmd(0x11, b""), drain_rx=False)
+        time.sleep(0.1)
+
+        # 0x60 with body [0x01, 0x00] clears any stale TLS state in the MCU
+        tx("SESSION_INIT (cmd 0x60)", encode_a0_cmd(0x60, bytes([0x01, 0x00])))
+
+        # 0x20 with empty body asks the MCU version — kicks the state machine
+        tx("VERSION (cmd 0x20)", encode_a0_cmd(0x20, b""))
+
         body = build_e4_body(0x20, 0, PSK_HASH_TAG)
         pkt = encode_a0_cmd(0xE4, body)
         print(f"[probe] TX cmd=0xE4 tag=0xbb020001 ({len(pkt)} bytes)")
