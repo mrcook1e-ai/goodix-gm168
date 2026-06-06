@@ -331,6 +331,19 @@ goodix_gm168_tls_pull (GoodixGM168TlsServer *self, guint8 *buf, guint16 size)
     /* На Linux EAGAIN == EWOULDBLOCK (оба == 11), проверяем только EAGAIN */
     if (n < 0 && errno == EAGAIN)
         return 0;   // нет данных — не ошибка
+
+    /* TEMP DEBUG: log first 96B of every record we pull to send to the
+     * sensor (ServerHello / SKE / SHD / our CCS / our Finished). Lets us
+     * compare with Frida traces to spot extension/version divergence. */
+    if (n > 0) {
+        GString *hex = g_string_sized_new (300);
+        ssize_t dump = n < 96 ? n : 96;
+        for (ssize_t i = 0; i < dump; i++)
+            g_string_append_printf (hex, "%02x ", buf[i]);
+        fp_warn ("goodix-gm168: TLS_PULL %zd bytes (first %zd): %s%s",
+                 n, dump, hex->str, n > 96 ? "..." : "");
+        g_string_free (hex, TRUE);
+    }
     return (int)n;
 }
 
