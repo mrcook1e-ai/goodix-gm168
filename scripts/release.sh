@@ -102,11 +102,19 @@ step_udev() {
     echo "[release]   udev rule installed"
 
     ME="$(id -un)"
-    if ! id -nG "$ME" | grep -qw plugdev; then
-        echo "[release]   adding $ME to plugdev (logout required to take effect)"
-        sudo usermod -aG plugdev "$ME"
+    # plugdev is a Debian/Ubuntu convention. Fedora uses uaccess via the
+    # udev rule's TAG+="uaccess", granting access to the active console
+    # user automatically — no group needed. Create the group only if it
+    # already exists in some form (no-op on stock Fedora).
+    if getent group plugdev >/dev/null; then
+        if ! id -nG "$ME" | grep -qw plugdev; then
+            echo "[release]   adding $ME to plugdev (logout required to take effect)"
+            sudo usermod -aG plugdev "$ME"
+        else
+            echo "[release]   $ME already in plugdev"
+        fi
     else
-        echo "[release]   $ME already in plugdev"
+        echo "[release]   plugdev group not present (Fedora uses uaccess) — skipping"
     fi
 }
 
