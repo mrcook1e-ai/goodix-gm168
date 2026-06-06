@@ -27,6 +27,7 @@ sudo dnf install -y --skip-unavailable \
     meson ninja-build \
     glib2-devel libgusb-devel gusb-devel openssl-devel \
     cairo-devel gobject-introspection-devel \
+    libgudev-devel cmake \
     libfprint nss-devel \
     pixman-devel
 
