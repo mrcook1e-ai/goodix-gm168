@@ -72,7 +72,7 @@ step_build() {
             --buildtype=release \
             -Dc_args='-O2 -DNDEBUG' \
             -Dintrospection=false \
-            -Ddoc=disabled \
+            -Ddoc=false \
             -Dgtk-examples=false
     else
         cd "$BUILD_DIR"
