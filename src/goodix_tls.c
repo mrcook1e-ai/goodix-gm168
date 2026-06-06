@@ -92,6 +92,13 @@ create_ctx (void)
     SSL_CTX_set_min_proto_version (ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version (ctx, TLS1_2_VERSION);
 
+    // OpenSSL 3.0+ default security level is 2, which rejects PSK-CBC
+    // suites as "legacy" — SSL_accept then fails with "cipher operation
+    // failed". The sensor only speaks PSK-AES128-CBC-SHA256, so we must
+    // drop the level. SECLEVEL=0 permits everything (we control the
+    // cipher list above, so this is safe).
+    SSL_CTX_set_security_level (ctx, 0);
+
     // КРИТИЧНО: CBC-SHA256, НЕ GCM!
     if (SSL_CTX_set_cipher_list (ctx, GOODIX_GM168_TLS_CIPHER) != 1) {
         g_warning ("goodix-gm168: failed to set cipher list: %s",
