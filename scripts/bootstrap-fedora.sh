@@ -23,7 +23,7 @@ echo "[bootstrap] install dnf packages"
 # --skip-unavailable lets dnf install everything that exists; we
 # verify the critical bits afterwards.
 sudo dnf install -y --skip-unavailable \
-    git rsync make gcc pkgconf-pkg-config \
+    git rsync make gcc gcc-c++ pkgconf-pkg-config \
     meson ninja-build \
     glib2-devel libgusb-devel gusb-devel openssl-devel \
     cairo-devel gobject-introspection-devel \
