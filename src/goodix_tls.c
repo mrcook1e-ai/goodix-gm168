@@ -114,11 +114,21 @@ create_ctx (void)
     SSL_CTX_set_max_proto_version (ctx, TLS1_2_VERSION);
 
     // OpenSSL 3.0+ default security level is 2, which rejects PSK-CBC
-    // suites as "legacy" — SSL_accept then fails with "cipher operation
-    // failed". The sensor only speaks PSK-AES128-CBC-SHA256, so we must
-    // drop the level. SECLEVEL=0 permits everything (we control the
-    // cipher list above, so this is safe).
+    // suites as "legacy". The sensor only speaks PSK-AES128-CBC-SHA256,
+    // so we must drop the level. SECLEVEL=0 permits everything (we
+    // control the cipher list above, so this is safe).
     SSL_CTX_set_security_level (ctx, 0);
+
+    // The GM168 firmware predates RFC 7627 (Extended Master Secret) and
+    // RFC 5746 (secure renegotiation). OpenSSL 3.0+ defaults to enforcing
+    // EMS and refusing legacy renegotiation, which derives different
+    // master-secret keys than the sensor expects and surfaces as
+    // "decryption failed or bad record mac" on the very first Finished.
+    // Disable both — confirmed-correct PSK + legacy KDF matches the MCU.
+    SSL_CTX_set_options (ctx,
+                         SSL_OP_NO_EXTENDED_MASTER_SECRET |
+                         SSL_OP_LEGACY_SERVER_CONNECT |
+                         SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
 
     // КРИТИЧНО: CBC-SHA256, НЕ GCM!
     if (SSL_CTX_set_cipher_list (ctx, GOODIX_GM168_TLS_CIPHER) != 1) {
