@@ -127,8 +127,18 @@ create_ctx (void)
     // Disable both — confirmed-correct PSK + legacy KDF matches the MCU.
     SSL_CTX_set_options (ctx,
                          SSL_OP_NO_EXTENDED_MASTER_SECRET |
+                         SSL_OP_NO_ENCRYPT_THEN_MAC |
                          SSL_OP_LEGACY_SERVER_CONNECT |
                          SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+    // NB: SSL_OP_NO_ENCRYPT_THEN_MAC is the load-bearing flag here.
+    // OpenSSL 3.x defaults to the RFC 7366 Encrypt-then-MAC extension for
+    // CBC suites via a fused AES-CBC-HMAC-SHA EtM cipher implementation,
+    // but the GM168 firmware does legacy MAC-then-Encrypt. The mismatch
+    // makes the very first record fail with the queue
+    //   1C800066 Provider routines::cipher operation failed
+    //   0A000119 SSL routines::decryption failed or bad record mac
+    //   0A000139 SSL routines::record layer failure
+    // which is exactly what we saw before disabling EtM.
 
     // КРИТИЧНО: CBC-SHA256, НЕ GCM!
     if (SSL_CTX_set_cipher_list (ctx, GOODIX_GM168_TLS_CIPHER) != 1) {
