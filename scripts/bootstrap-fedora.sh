@@ -3,6 +3,15 @@
 # udev rule, plugdev group. Re-runnable.
 set -euo pipefail
 
+# Refuse to run as root — script uses $HOME/$USER and self-sudoes for
+# the privileged steps. Running under sudo makes $HOME=/root which
+# breaks subsequent ./scripts/release.sh runs as the normal user.
+if [[ "$(id -u)" -eq 0 ]]; then
+    echo "[bootstrap] ERROR: do NOT run as root / under sudo."
+    echo "            Run as your normal user — the script will sudo where needed."
+    exit 1
+fi
+
 DEV_DIR="${DEV_DIR:-$HOME/dev}"
 REPO_DIR="${REPO_DIR:-$DEV_DIR/goodix-gm168}"
 LIBFPRINT_DIR="${LIBFPRINT_DIR:-$DEV_DIR/libfprint}"
@@ -10,13 +19,33 @@ PREFIX="${PREFIX:-/opt/libfprint-gm168}"
 LIBFPRINT_TAG="${LIBFPRINT_TAG:-v1.94.9}"
 
 echo "[bootstrap] install dnf packages"
-sudo dnf install -y \
+# Note: gusb-devel was renamed to libgusb-devel in newer Fedora.
+# --skip-unavailable lets dnf install everything that exists; we
+# verify the critical bits afterwards.
+sudo dnf install -y --skip-unavailable \
     git rsync make gcc pkgconf-pkg-config \
     meson ninja-build \
-    glib2-devel gusb-devel openssl-devel \
+    glib2-devel libgusb-devel gusb-devel openssl-devel \
     cairo-devel gobject-introspection-devel \
     libfprint nss-devel \
-    pixman-devel || true
+    pixman-devel
+
+# Verify the critical build tools landed.
+missing=()
+for cmd in meson ninja gcc pkg-config rsync git; do
+    command -v "$cmd" >/dev/null || missing+=("$cmd")
+done
+if (( ${#missing[@]} > 0 )); then
+    echo "[bootstrap] ERROR: missing tools after dnf: ${missing[*]}"
+    echo "            Try: sudo dnf install -y ${missing[*]}"
+    exit 1
+fi
+# Verify gusb dev headers landed under either name.
+if ! pkg-config --exists gusb; then
+    echo "[bootstrap] ERROR: gusb pkg-config not found after install."
+    echo "            Try: sudo dnf install -y libgusb-devel"
+    exit 1
+fi
 
 echo "[bootstrap] create dirs"
 mkdir -p "$DEV_DIR" "$REPO_DIR/logs"
