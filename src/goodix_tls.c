@@ -39,11 +39,32 @@
 static GError *
 err_from_ssl (void)
 {
-    // Используем g_new вместо malloc для совместимости с g_error_free
-    unsigned long code = ERR_get_error ();
-    const char   *msg  = ERR_reason_error_string (code);
-    return g_error_new_literal (G_FILE_ERROR, (gint)code,
-                                 msg ? msg : "unknown SSL error");
+    // Drain the WHOLE OpenSSL error queue, not just the first error —
+    // PSK / cipher failures usually surface as a stack (e.g. "bad
+    // record mac" + "cipher operation failed"). The first-only path
+    // hides the root cause.
+    GString *all = g_string_new (NULL);
+    unsigned long first_code = 0;
+    unsigned long code;
+    char buf[256];
+    int  count = 0;
+
+    while ((code = ERR_get_error ()) != 0) {
+        if (first_code == 0)
+            first_code = code;
+        ERR_error_string_n (code, buf, sizeof (buf));
+        if (count > 0)
+            g_string_append (all, " | ");
+        g_string_append (all, buf);
+        count++;
+    }
+    if (count == 0)
+        g_string_assign (all, "unknown SSL error (queue empty)");
+    fp_warn ("goodix-gm168: OpenSSL error queue (%d entries): %s",
+             count, all->str);
+    GError *err = g_error_new_literal (G_FILE_ERROR, (gint)first_code, all->str);
+    g_string_free (all, TRUE);
+    return err;
 }
 
 // ─── PSK callback ─────────────────────────────────────────────────────────────
