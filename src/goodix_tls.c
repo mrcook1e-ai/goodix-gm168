@@ -128,8 +128,21 @@ create_ctx (void)
     SSL_CTX_set_options (ctx,
                          SSL_OP_NO_EXTENDED_MASTER_SECRET |
                          SSL_OP_NO_ENCRYPT_THEN_MAC |
+                         SSL_OP_NO_RENEGOTIATION |
+                         SSL_OP_NO_TICKET |
                          SSL_OP_LEGACY_SERVER_CONNECT |
                          SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+
+    // The GM168 firmware is TLS-1.0-era retrofitted to TLS 1.2 PSK. Its
+    // ClientHello carries NO extensions block, but advertises secure
+    // renegotiation via the SCSV pseudo-cipher 0x00FF. RFC 5746 then
+    // requires us to echo an empty renegotiation_info extension in the
+    // ServerHello — which the sensor's firmware does NOT account for in
+    // its handshake transcript hash, breaking Finished verify_data.
+    //
+    // SSL_OP_NO_RENEGOTIATION + SSL_OP_NO_TICKET together convince
+    // OpenSSL 3.x to omit the ServerHello extensions block when the
+    // ClientHello had none, restoring transcript symmetry.
     // NB: SSL_OP_NO_ENCRYPT_THEN_MAC is the load-bearing flag here.
     // OpenSSL 3.x defaults to the RFC 7366 Encrypt-then-MAC extension for
     // CBC suites via a fused AES-CBC-HMAC-SHA EtM cipher implementation,
