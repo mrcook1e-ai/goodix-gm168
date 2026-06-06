@@ -283,6 +283,20 @@ int
 goodix_gm168_tls_feed (GoodixGM168TlsServer *self, const guint8 *data,
                         guint32 length)
 {
+    /* TEMP DEBUG: log first 64 bytes of every TLS record we feed to OpenSSL.
+     * Critical for diagnosing handshake failures — lets us see what the
+     * sensor's TLS implementation actually emits. Remove once handshake
+     * works. */
+    {
+        GString *hex = g_string_sized_new (200);
+        guint32 dump = length < 64 ? length : 64;
+        for (guint32 i = 0; i < dump; i++)
+            g_string_append_printf (hex, "%02x ", data[i]);
+        fp_warn ("goodix-gm168: TLS_FEED %u bytes (first %u): %s%s",
+                 length, dump, hex->str, length > 64 ? "..." : "");
+        g_string_free (hex, TRUE);
+    }
+
     ssize_t written = write (self->client_fd, data, length);
     if (written < 0) {
         g_printerr("goodix-gm168: tls_feed write error: %s (errno=%d)\n", strerror(errno), errno);
