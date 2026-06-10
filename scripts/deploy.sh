@@ -3,8 +3,8 @@
 # Run on PC (Git Bash / WSL). Requires passwordless SSH on port 2200.
 set -euo pipefail
 
-REMOTE_HOST="${GM168_HOST:-mrcook1e@192.168.1.14}"
-REMOTE_PORT="${GM168_PORT:-2200}"
+REMOTE_HOST="${GM168_HOST:-mrcook1e@192.168.1.23}"
+REMOTE_PORT="${GM168_PORT:-22}"
 REMOTE_DIR="${GM168_REMOTE_DIR:-/home/mrcook1e/dev/goodix-gm168}"
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"

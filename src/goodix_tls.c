@@ -153,7 +153,7 @@ create_ctx (void)
     //   0A000139 SSL routines::record layer failure
     // which is exactly what we saw before disabling EtM.
 
-    // КРИТИЧНО: CBC-SHA256, НЕ GCM!
+    // IMPORTANT: CBC-SHA256, NOT GCM!
     if (SSL_CTX_set_cipher_list (ctx, GOODIX_GM168_TLS_CIPHER) != 1) {
         g_warning ("goodix-gm168: failed to set cipher list: %s",
                    GOODIX_GM168_TLS_CIPHER);
@@ -296,19 +296,17 @@ int
 goodix_gm168_tls_feed (GoodixGM168TlsServer *self, const guint8 *data,
                         guint32 length)
 {
-    /* TEMP DEBUG: log first 64 bytes of every TLS record we feed to OpenSSL.
-     * Critical for diagnosing handshake failures — lets us see what the
-     * sensor's TLS implementation actually emits. Remove once handshake
-     * works. */
+#ifdef GM168_DEBUG
     {
         GString *hex = g_string_sized_new (200);
         guint32 dump = length < 64 ? length : 64;
         for (guint32 i = 0; i < dump; i++)
             g_string_append_printf (hex, "%02x ", data[i]);
-        fp_warn ("goodix-gm168: TLS_FEED %u bytes (first %u): %s%s",
-                 length, dump, hex->str, length > 64 ? "..." : "");
+        fp_dbg ("goodix-gm168: TLS_FEED %u bytes (first %u): %s%s",
+                length, dump, hex->str, length > 64 ? "..." : "");
         g_string_free (hex, TRUE);
     }
+#endif
 
     ssize_t written = write (self->client_fd, data, length);
     if (written < 0) {
@@ -321,29 +319,31 @@ goodix_gm168_tls_feed (GoodixGM168TlsServer *self, const guint8 *data,
     return (int)written;
 }
 
-// Забрать TLS байты которые OpenSSL хочет отправить MCU
-// [FIX-1] O_NONBLOCK: возвращает -1/EAGAIN если данных нет (не блокирует).
-// Вызывать в цикле after sleep(1-5ms) пока не получим данные или таймаут.
+// Pull TLS bytes that OpenSSL wants to send to the MCU.
+// O_NONBLOCK: returns -1/EAGAIN when no data is available (non-blocking).
+// Call in a loop with 1-5 ms sleep until data arrives or timeout.
 int
 goodix_gm168_tls_pull (GoodixGM168TlsServer *self, guint8 *buf, guint16 size)
 {
     ssize_t n = read (self->client_fd, buf, size);
-    /* На Linux EAGAIN == EWOULDBLOCK (оба == 11), проверяем только EAGAIN */
     if (n < 0 && errno == EAGAIN)
-        return 0;   // нет данных — не ошибка
+        return 0;   // no data yet — not an error
+    if (n < 0) {
+        fp_warn ("goodix-gm168: tls_pull read error: %s (errno=%d)", strerror(errno), errno);
+        return 0;
+    }
 
-    /* TEMP DEBUG: log first 96B of every record we pull to send to the
-     * sensor (ServerHello / SKE / SHD / our CCS / our Finished). Lets us
-     * compare with Frida traces to spot extension/version divergence. */
+#ifdef GM168_DEBUG
     if (n > 0) {
         GString *hex = g_string_sized_new (300);
         ssize_t dump = n < 96 ? n : 96;
         for (ssize_t i = 0; i < dump; i++)
             g_string_append_printf (hex, "%02x ", buf[i]);
-        fp_warn ("goodix-gm168: TLS_PULL %zd bytes (first %zd): %s%s",
-                 n, dump, hex->str, n > 96 ? "..." : "");
+        fp_dbg ("goodix-gm168: TLS_PULL %zd bytes (first %zd): %s%s",
+                n, dump, hex->str, n > 96 ? "..." : "");
         g_string_free (hex, TRUE);
     }
+#endif
     return (int)n;
 }
 

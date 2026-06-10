@@ -47,10 +47,14 @@
 /* Pacing between TLS RX/TX pulls during handshake.                        */
 #define GM168_TLS_PUMP_DELAY_MS         10
 
-/* REARM_DELAY (submit path): let FDT settle before next touch. The retry
- * path uses GM168_REARM_RETRY_DELAY_MS — defined in goodix_gm168.c next
- * to the quality-gate tunables.                                           */
-#define GM168_REARM_DELAY_MS            1500
+/* REARM_DELAY (submit path): pause between FDT_REARM(0x34) and IRQ_ARM(0xAE)
+ * for the sensor's capacitive front-end to discharge before re-arming FDT.
+ *
+ * Windows uses ~115ms (measured from patches/goodix.pcapng enrollment
+ * trace, see scripts/analyze_enroll_timing.py).  We kept 1500ms from the
+ * provisioning pcap which is overkill for enrollment.  150ms = Windows
+ * value + 35ms slack for slow USB hosts / usbipd.                          */
+#define GM168_REARM_DELAY_MS            150
 
 /* ---- Retry caps ------------------------------------------------------- */
 
@@ -75,7 +79,24 @@
  */
 #define GM168_INIT_DEADLINE_MS          10000  /* typical 1.95 s          */
 #define GM168_CAPTURE_DEADLINE_MS       2000   /* budget 600 ms, ~3× slack */
-#define GM168_REARM_DEADLINE_MS         4000   /* typical 1.5 s, ~2.5×    */
+/* GM168_WAIT_LIFT_MAX_REARMS caps how many times wait_lift_cb may jump
+ * back to REARM_32.  Total wait_lift cycles = MAX_REARMS + 1 (the +1 is
+ * the initial cycle before any re-arm).
+ *
+ * GM168_WAIT_LIFT_POLL_MS is the per-cycle USB read timeout in the
+ * lift-detection loop.  Was 1000 ms (SHORT_TIMEOUT), which dominated
+ * REARM wall-clock: 2×1000 = 2 s per stage just waiting for "FDT did
+ * NOT re-fire".  300 ms is enough to give the user time to lift while
+ * keeping the total bounded.  Windows enroll never waits for lift
+ * (see scripts/analyze_enroll_timing.py): it arms FDT and immediately
+ * returns to polling — we keep the wait because libfprint requires
+ * a finger-off/finger-on cycle between enrollment stages.
+ *
+ *   max REARM time = REARM_DELAY + (MAX+1)×POLL × 2 (FDT fire + timeout)
+ *                  = 150 + 2×600 = 1350 ms typical                       */
+#define GM168_WAIT_LIFT_MAX_REARMS      1
+#define GM168_WAIT_LIFT_POLL_MS         300
+#define GM168_REARM_DEADLINE_MS         3000   /* generous: typical 1.3s  */
 #define GM168_DEINIT_DEADLINE_MS        3000   /* one cmd + ACK, > RX_TIMEOUT */
 #define GM168_RECOVER_DEADLINE_MS       5000   /* like init w/o TLS+BG    */
 
@@ -93,7 +114,7 @@ _Static_assert (GM168_USB_RX_LONG_TIMEOUT_MS  == 3000, "G13: long RX timeout dri
 _Static_assert (GM168_USB_TX_TIMEOUT_MS       == 2000, "G13: TX timeout drifted");
 _Static_assert (GM168_WAKEUP_DELAY_MS         == 50,   "G13: wakeup delay drifted");
 _Static_assert (GM168_TLS_PUMP_DELAY_MS       == 10,   "G13: TLS pump delay drifted");
-_Static_assert (GM168_REARM_DELAY_MS          == 1500, "G13: rearm delay drifted");
+_Static_assert (GM168_REARM_DELAY_MS          == 150,  "G13: rearm delay drifted (now matches Windows ~115ms + slack)");
 _Static_assert (GM168_USB_RX_RETRY_LIMIT      == 60,   "G13: RX retry limit drifted");
 _Static_assert (GM168_TLS_RETRY_LIMIT         == 60,   "G13: TLS retry limit drifted");
 
@@ -102,6 +123,9 @@ _Static_assert (GM168_TLS_RETRY_LIMIT         == 60,   "G13: TLS retry limit dri
  * quality-gate tunables — its assert lives there. */
 _Static_assert (GM168_INIT_DEADLINE_MS    > GM168_USB_RX_TIMEOUT_MS, "G1: init deadline too tight");
 _Static_assert (GM168_REARM_DEADLINE_MS   > GM168_REARM_DELAY_MS,    "G1: rearm deadline must exceed REARM_DELAY");
+/* Total cycles = MAX_REARMS + 1; each cycle ≤ 2×POLL */
+_Static_assert (GM168_REARM_DEADLINE_MS   > GM168_REARM_DELAY_MS + (GM168_WAIT_LIFT_MAX_REARMS + 1) * GM168_WAIT_LIFT_POLL_MS * 2,
+                "G1: rearm deadline too tight for max FDT re-arm cycles");
 _Static_assert (GM168_DEINIT_DEADLINE_MS  > GM168_USB_RX_TIMEOUT_MS, "G1: deinit deadline too tight");
 
 #endif /* GM168_TIMEOUTS_H */

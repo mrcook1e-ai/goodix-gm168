@@ -21,14 +21,14 @@
 #define GOODIX_GM168_INTERFACE     0
 #define GOODIX_GM168_EP_OUT        0x01
 #define GOODIX_GM168_EP_IN         0x83   // NOTE: 0x83, NOT 0x82 like 55b4!
-// EP_IN_SIZE: 16KB — достаточно для B2 пакета (~10642B за один libusb_bulk_transfer
-// Примечание: libusb читает ровно столько сколько пришло, не блокируясь.
+// EP_IN_SIZE: 16 KB — enough for one B2 packet (~10642 B per libusb_bulk_transfer).
+// libusb returns exactly as many bytes as arrived; it does not block.
 #define GOODIX_GM168_EP_IN_SIZE    (16 * 1024)
 #define GOODIX_GM168_EP_OUT_SIZE   0x40   // 64 bytes per chunk
 #define GOODIX_GM168_TIMEOUT_MS    2000
 
 // ─── Firmware ─────────────────────────────────────────────────────────────────
-// Верифицировано из Binary Ninja: строка "GF3206_GM168SEC_APP_10008"
+// Verified from Binary Ninja: string "GF3206_GM168SEC_APP_10008"
 #define GOODIX_GM168_FIRMWARE_VER  "GF3206_GM168SEC_APP_10008"
 
 // ─── A0 Packet format (Geneva/Milan) ─────────────────────────────────────────
@@ -61,6 +61,9 @@
 #define GOODIX_GM168_CMD_PSK_READ      0x43  /* read PSK from sensor */
 #define GOODIX_GM168_CMD_PSK_WRITE     0x44  /* write PSK to sensor */
 #define GOODIX_GM168_CMD_SPEC_DATA     0xE4  /* MCU spec-data RW (sealed PSK lives here) */
+#define GOODIX_GM168_CMD_SET_PARAM     0x90  /* sensor register map (sent after TLS) */
+#define GOODIX_GM168_CMD_DEL_TMPL      0xC4  /* delete fingerprint template */
+#define GOODIX_GM168_CMD_STORE_PSK     0xD2  /* store PSK in sensor NVM */
 
 /* Sealed PSK blob: DPAPI-encrypted, tag 0xbb010002, total 324 bytes,
  * read via cmd 0xE4 in 256 + 68 byte chunks. See docs/PSK.md. */
@@ -71,7 +74,7 @@
 // ─── Status codes ─────────────────────────────────────────────────────────────
 #define GOODIX_GM168_STATUS_OK        0x00
 #define GOODIX_GM168_STATUS_BUSY      0x01
-#define GOODIX_GM168_STATUS_TOUCH     0x02  // finger detected (в FDT echo)
+#define GOODIX_GM168_STATUS_TOUCH     0x02  // finger detected (in FDT echo)
 #define GOODIX_GM168_STATUS_BAD_CMD   0xFF
 
 // ─── Touch event detection ────────────────────────────────────────────────────
@@ -90,19 +93,18 @@ extern guint8 goodix_gm168_psk[32];
 extern const char goodix_gm168_psk_identity[];
 
 // ─── TLS ──────────────────────────────────────────────────────────────────────
-// Cipher suite из Binary Ninja: "TLS-PSK-WITH-AES-128-CBC-SHA256"
-// ВНИМАНИЕ: GM168 использует CBC, а НЕ GCM (как 55b4)!
+// Cipher suite from Binary Ninja: "TLS-PSK-WITH-AES-128-CBC-SHA256"
+// NOTE: GM168 uses CBC, NOT GCM (unlike 55b4)!
 #define GOODIX_GM168_TLS_CIPHER  "PSK-AES128-CBC-SHA256"
 #define GOODIX_GM168_TLS_PORT    4433
 
-// ─── Zero PSK для инициализации на новых устройствах ──────────────────────────
-extern const guint8 goodix_gm168_zero_psk[32];
-extern const guint8 goodix_gm168_zero_psk_wb[96];
-extern const guint8 goodix_gm168_sgx_empty_header[8];
-extern const guint8 goodix_gm168_wb_header[8];
-extern const guint8 goodix_gm168_wb_magic_prefix[10];
+// ─── Post-TLS setup payloads (extracted from Windows all.pcapng capture) ────
+extern const guint8 goodix_gm168_set_param[];
+extern const guint16 goodix_gm168_set_param_len;
+extern const guint8 goodix_gm168_del_tmpl[];
+extern const guint16 goodix_gm168_del_tmpl_len;
 
-// ─── FDT payloads (верифицированы из Frida Enroll сессии 07:07:19) ───────────
+// ─── FDT payloads (updated to match Windows all.pcapng values) ───────────────
 extern const guint8 goodix_gm168_fdt_setup[];
 extern const guint16 goodix_gm168_fdt_setup_len;
 
@@ -112,9 +114,6 @@ extern const guint16 goodix_gm168_fdt_rearm_len;
 // Capture trigger payload (0x20)
 extern const guint8 goodix_gm168_capture_payload[];
 extern const guint16 goodix_gm168_capture_payload_len;
-
-// IRQ arm payload (0xAE) — верифицирован из Frida: единственная команда
-extern const guint8 goodix_gm168_irq_arm[];
 
 // Session init payload (0x60)
 extern const guint8 goodix_gm168_session_init[];

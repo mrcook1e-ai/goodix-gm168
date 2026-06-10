@@ -19,6 +19,7 @@
 #include "gm168_timeouts.h"
 #include "gm168_trace.h"
 #include "gm168_usb_errors.h"
+#include "gm168_log.h"
 
 #include <math.h>
 
@@ -84,8 +85,18 @@ enum init_states {
     INIT_TLS_RX,
     INIT_TLS_DELAY,
     INIT_TLS_TX_PULL,
+    /* Post-TLS setup: Windows sends SET_PARAM + DEL_TMPL×2 before SESSION_INIT */
+    INIT_SET_PARAM,
+    INIT_SET_PARAM_ACK,
+    INIT_DEL_TMPL_1,
+    INIT_DEL_TMPL_1_ACK,
+    INIT_DEL_TMPL_2,
+    INIT_DEL_TMPL_2_ACK,
     INIT_SESSION,
     INIT_SESSION_ACK,
+    /* Windows sends 0xD6 (POWER) between SESSION_INIT and ARM */
+    INIT_D6_POST,
+    INIT_D6_POST_ACK,
     INIT_ARM,
     INIT_ARM_ACK,
     INIT_FDT,
@@ -167,8 +178,22 @@ struct _FpDeviceGoodixGm168 {
     int      capture_attempt;
     gint64   capture_start_us;
 
+    /* Dual-capture (Windows enroll pattern): take 2 frames per touch
+     * without REARM between them, pick the better one.  Matches the
+     * pcap-observed Windows flow (SCAN_TRIG → image → SCAN_TRIG → image
+     * → FDT_SETUP) measured in patches/goodix.pcapng @ +7.427..+7.536s.
+     * dual_pending_img holds frame #1 while we capture frame #2.       */
+    FpImage *dual_pending_img;
+    gfloat   dual_pending_quality;
+    gboolean dual_in_second;        /* TRUE while waiting for frame #2  */
+
     /* G7: opt-in per-state timing trace. Enabled by $GM168_TRACE=1.      */
     GM168Trace trace;
+
+    /* Structured per-session text log. Opened in dev_open, closed in
+     * dev_close. Always-on: no env flag required.                       */
+    Gm168Log log;
+    int      log_stage_count;  /* # images submitted this activate session */
 
     /* G1: wall-clock deadline for the currently-running SSM. Set by
      * start_*_ssm helpers and checked at the top of each *_run_state
@@ -188,6 +213,10 @@ struct _FpDeviceGoodixGm168 {
      * a soft reset). Beyond that we let the watchdog or quality-gate
      * budget kill the capture.                                            */
     int capture_rx_timeouts;
+
+    /* Persistent heap buffer for TLS decryption (GOODIX_GM168_EP_IN_SIZE bytes).
+     * Replaces 5 × 16 KB stack buffers in the SSM states.                   */
+    guint8  *tls_dec_buf;
 };
 
 #define GM168_CAP_RX_RETRIG_AFTER 2
@@ -300,8 +329,15 @@ on_tls_done (GoodixGM168TlsServer *tls, GError *error, gpointer ud)
     if (!error) {
         self->tls_done = TRUE;
         fp_dbg ("TLS HANDSHAKE DONE");
+        {
+            double ms = (self->log.init_start_us > 0)
+                      ? (g_get_monotonic_time () - self->log.init_start_us) / 1000.0
+                      : 0.0;
+            GM168_LOG_TLS (&self->log, "✓ handshake done  (%.0f ms)", ms);
+        }
     } else {
         fp_warn ("TLS error: %s", error->message);
+        GM168_LOG_ERR (&self->log, "TLS failed: %s", error->message);
     }
 }
 
@@ -833,19 +869,18 @@ process_rx_buffer_for_tls(FpDeviceGoodixGm168 *self, const guint8 *buf, gsize le
     while (offset < len) {
         guint8 type = buf[offset];
         if (type == GOODIX_GM168_PKT_TLS) { // 0xB0 TLS record
-            if (offset + 4 <= len) {
-                guint16 b0_len = (guint16)buf[offset+1] | ((guint16)buf[offset+2] << 8);
-                if (offset + 4 + b0_len <= len) {
-                    goodix_gm168_tls_feed (&self->tls, buf + offset + 4, b0_len);
-                }
-                offset += 4 + b0_len;
-            } else { break; }
+            if (offset + 4 > len) break;
+            guint16 b0_len = (guint16)buf[offset+1] | ((guint16)buf[offset+2] << 8);
+            if (b0_len == 0 || offset + 4 + b0_len > len) break;
+            goodix_gm168_tls_feed (&self->tls, buf + offset + 4, b0_len);
+            offset += 4 + b0_len;
         } else if (type == GOODIX_GM168_PKT_CMD) { // 0xA0 Command ACK
             if (offset + 4 <= len) {
                 guint16 a0_len = (guint16)buf[offset+1] | ((guint16)buf[offset+2] << 8);
                 offset += 4 + a0_len;
             } else { break; }
         } else if (type == GOODIX_GM168_PKT_IMG) { // 0xB2 Image packet
+            if (offset + 4 > len) break;           /* bounds check before reading length field */
             guint16 b2_len;
             const guint8 *tls_data = goodix_gm168_decode_img (buf + offset, len - offset, &b2_len);
             if (tls_data && b2_len > 0) {
@@ -931,9 +966,31 @@ ack_cb (FpiUsbTransfer *transfer, FpDevice *device, gpointer user_data, GError *
         g_string_free(hs, TRUE);
 
         if (type == GOODIX_GM168_PKT_CMD) {
-            /* Plain command ACK (A0) */
+            /* A0 packets come in two flavours:
+             *   IMMEDIATE: [A0][6][0][hsum][B0][pL][pH][echo][status][bsum]  buffer[4]=0xB0
+             *   FINAL:     [A0][5][0][hsum][echo][2][0][status][bsum]        buffer[4]=echo_cmd
+             *
+             * Only advance the SSM on IMMEDIATE (buffer[4]==0xB0). FINAL ACKs are
+             * trailing notifications that arrive in the *next* state's ack window
+             * and must be drained without counting as progress, otherwise each
+             * plaintext command causes a cascading one-state shift. */
+            if (transfer->actual_length >= 5 &&
+                transfer->buffer[4] != GOODIX_GM168_PKT_TLS) {
+                /* FINAL ACK — drain and re-listen */
+                fp_dbg ("ack_cb: A0 FINAL echo=0x%02X — re-listen",
+                        transfer->buffer[4]);
+                FpiUsbTransfer *t2 = fpi_usb_transfer_new (device);
+                fpi_usb_transfer_fill_bulk (t2, GOODIX_GM168_EP_IN, GOODIX_GM168_EP_IN_SIZE);
+                t2->ssm = transfer->ssm;
+                fpi_usb_transfer_submit (t2, GM168_USB_RX_TIMEOUT_MS,
+                                         self->io_cancellable, ack_cb, NULL);
+                return;
+            }
             if (transfer->actual_length >= 9) {
+                guint8 echo   = transfer->buffer[7];
                 guint8 status = transfer->buffer[8];
+                fp_dbg ("ack_cb: A0 imm echo=0x%02X status=0x%02X",
+                        echo, status);
                 if (status == GOODIX_GM168_STATUS_BAD_CMD) {
                     fpi_ssm_mark_failed (transfer->ssm,
                                          fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -985,6 +1042,14 @@ async_send_cmd (FpiSsm *ssm, FpDevice *dev, guint8 cmd, const guint8 *payload, g
     FpDeviceGoodixGm168 *self = FPI_DEVICE_GOODIX_GM168 (dev);
     guint32 pkt_len;
     guint8 *pkt = goodix_gm168_encode_cmd (cmd, payload, payload_len, &pkt_len);
+
+    /* Log every outgoing packet (first 32 bytes inline). */
+    {
+        char label[16];
+        snprintf (label, sizeof (label), "cmd=%02Xh", cmd);
+        gm168_log_tx (&self->log, label, pkt, pkt_len);
+    }
+
     FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
     fpi_usb_transfer_fill_bulk_full (transfer, GOODIX_GM168_EP_OUT, pkt, pkt_len, g_free);
     transfer->ssm = ssm;
@@ -1133,8 +1198,8 @@ init_tls_rx_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GEr
     if (error) {
         if (g_error_matches(error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT)) {
             g_error_free (error);
-            if (self->tls_done) 
-                fpi_ssm_jump_to_state (transfer->ssm, INIT_SESSION);
+            if (self->tls_done)
+                fpi_ssm_jump_to_state (transfer->ssm, INIT_SET_PARAM);
             else {
                 // Return to RX if still waiting
                 fpi_ssm_jump_to_state (transfer->ssm, INIT_TLS_RX);
@@ -1394,7 +1459,7 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
             /* Cap TLS read loop iterations (~60s wall time). */
             if (self->tls_done) {
                 self->tls_retry = 0;
-                fpi_ssm_jump_to_state(ssm, INIT_SESSION);
+                fpi_ssm_jump_to_state(ssm, INIT_SET_PARAM);
             } else if (++self->tls_retry > GM168_TLS_RETRY_LIMIT) {
                 fpi_ssm_mark_failed (ssm,
                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -1414,8 +1479,8 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
 
         case INIT_TLS_TX_PULL:
             {
-                guint8 tls_out[GOODIX_GM168_EP_IN_SIZE];
-                int out_n = goodix_gm168_tls_pull (&self->tls, tls_out, sizeof(tls_out));
+                guint8 *tls_out = self->tls_dec_buf;
+                int out_n = goodix_gm168_tls_pull (&self->tls, tls_out, GOODIX_GM168_EP_IN_SIZE);
                 if (out_n > 0) {
                     guint32 b0_len;
                     guint8 *b0 = goodix_gm168_encode_tls (tls_out, (guint16)out_n, &b0_len);
@@ -1430,11 +1495,36 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
                      * answers it on already-provisioned devices and SSM
                      * would die on a 5 s timeout.                          */
                     self->tls_retry = 0;
-                    fpi_ssm_jump_to_state (ssm, INIT_SESSION);
+                    fpi_ssm_jump_to_state (ssm, INIT_SET_PARAM);
                 } else {
                     fpi_ssm_jump_to_state (ssm, INIT_TLS_RX);
                 }
             }
+            break;
+
+        case INIT_SET_PARAM:
+            fp_dbg("INIT_SET_PARAM");
+            async_send_cmd (ssm, dev, GOODIX_GM168_CMD_SET_PARAM,
+                            goodix_gm168_set_param, goodix_gm168_set_param_len);
+            break;
+        case INIT_SET_PARAM_ACK:
+            async_recv_ack (ssm, dev, GM168_USB_RX_TIMEOUT_MS);
+            break;
+        case INIT_DEL_TMPL_1:
+            fp_dbg("INIT_DEL_TMPL_1");
+            async_send_cmd (ssm, dev, GOODIX_GM168_CMD_DEL_TMPL,
+                            goodix_gm168_del_tmpl, goodix_gm168_del_tmpl_len);
+            break;
+        case INIT_DEL_TMPL_1_ACK:
+            async_recv_ack (ssm, dev, GM168_USB_RX_TIMEOUT_MS);
+            break;
+        case INIT_DEL_TMPL_2:
+            fp_dbg("INIT_DEL_TMPL_2");
+            async_send_cmd (ssm, dev, GOODIX_GM168_CMD_DEL_TMPL,
+                            goodix_gm168_del_tmpl, goodix_gm168_del_tmpl_len);
+            break;
+        case INIT_DEL_TMPL_2_ACK:
+            async_recv_ack (ssm, dev, GM168_USB_RX_TIMEOUT_MS);
             break;
 
         case INIT_SESSION:
@@ -1445,6 +1535,16 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
             }
             break;
         case INIT_SESSION_ACK:
+            async_recv_ack (ssm, dev, GM168_USB_RX_TIMEOUT_MS);
+            break;
+        case INIT_D6_POST:
+            fp_dbg("INIT_D6_POST");
+            {
+                const guint8 d6[] = {0x00, 0x00};
+                async_send_cmd (ssm, dev, GOODIX_GM168_CMD_POWER, d6, 2);
+            }
+            break;
+        case INIT_D6_POST_ACK:
             async_recv_ack (ssm, dev, GM168_USB_RX_TIMEOUT_MS);
             break;
         case INIT_ARM:
@@ -1509,10 +1609,10 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
                         const guint8 *tls = goodix_gm168_decode_tls (sb->data, pkt_len, &tls_len);
                         if (tls && tls_len > 0) {
                             goodix_gm168_tls_feed (&self->tls, tls, tls_len);
-                            guint8 dec[GOODIX_GM168_EP_IN_SIZE];
+                            guint8 *dec = self->tls_dec_buf;
                             GError *err = NULL;
                             int dec_n = goodix_gm168_tls_recv (
-                                &self->tls, dec, sizeof(dec), &err);
+                                &self->tls, dec, GOODIX_GM168_EP_IN_SIZE, &err);
                             if (dec_n > 0)
                                 append_to_buf (self, dec, dec_n);
                             else if (err)
@@ -1531,10 +1631,10 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
                         const guint8 *tls = goodix_gm168_decode_img (sb->data, pkt_len, &tls_len);
                         if (tls && tls_len > 0) {
                             goodix_gm168_tls_feed (&self->tls, tls, tls_len);
-                            guint8 dec[GOODIX_GM168_EP_IN_SIZE];
+                            guint8 *dec = self->tls_dec_buf;
                             GError *err = NULL;
                             int dec_n = goodix_gm168_tls_recv (
-                                &self->tls, dec, sizeof(dec), &err);
+                                &self->tls, dec, GOODIX_GM168_EP_IN_SIZE, &err);
                             if (dec_n > 0)
                                 append_to_buf (self, dec, dec_n);
                             else if (err)
@@ -1615,8 +1715,15 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
                         if (bg[i] < lo) lo = bg[i];
                         if (bg[i] > hi) hi = bg[i];
                     }
-                    fp_warn ("BG averaged %d frames: hash=0x%08X sum=%u min=%u max=%u",
-                             self->bg_frames_captured, xorhash, sum, lo, hi);
+                    fp_dbg ("BG averaged %d frames: hash=0x%08X sum=%u min=%u max=%u",
+                            self->bg_frames_captured, xorhash, sum, lo, hi);
+                    {
+                        double ms = (self->log.init_start_us > 0)
+                                  ? (g_get_monotonic_time () - self->log.init_start_us) / 1000.0
+                                  : 0.0;
+                        GM168_LOG_BG (&self->log, "×%d  hash=%08Xh  (%.0f ms)",
+                                      self->bg_frames_captured, xorhash, ms);
+                    }
                 }
                 fpi_ssm_next_state (ssm); /* → INIT_BG_REARM_34_1 */
             }
@@ -1677,14 +1784,22 @@ init_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
 
     if (error) {
         fp_warn("Initialization failed: %s", error->message);
+        GM168_LOG_ERR (&self->log, "init failed: %s", error->message);
         fpi_image_device_activate_complete (img_dev, error);
         return;
     }
 
     fp_dbg("Device completely armed and initialized");
+    {
+        double ms = (self->log.init_start_us > 0)
+                  ? (g_get_monotonic_time () - self->log.init_start_us) / 1000.0
+                  : 0.0;
+        GM168_LOG_INIT (&self->log, "✓ armed  (%.0f ms)", ms);
+    }
+    self->log_stage_count = 0;
     fpi_image_device_activate_complete (img_dev, NULL);
-    
-    // We do NOT start polling for touch here. 
+
+    // We do NOT start polling for touch here.
     // libfprint will request it via change_state.
 }
 
@@ -1861,15 +1976,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
                         if (tls && tls_len > 0) {
                             goodix_gm168_tls_feed (&self->tls, tls, tls_len);
                             /* Handshake usually happens in INIT, but keep for robustness */
-                            guint8 dec[GOODIX_GM168_EP_IN_SIZE];
+                            guint8 *dec = self->tls_dec_buf;
                             GError *err = NULL;
-                            int dec_n = goodix_gm168_tls_recv (&self->tls, dec, sizeof(dec), &err);
+                            int dec_n = goodix_gm168_tls_recv (&self->tls, dec, GOODIX_GM168_EP_IN_SIZE, &err);
                             if (dec_n > 0) {
                                 append_to_buf (self, dec, dec_n);
-                            } else {
-                                fp_err("CAP_PROCESS B0: TLS decryption error: %s", err ? err->message : "unknown (dec_n<=0)");
+                            } else if (err) {
+                                /* dec_n==0 with err==NULL is SSL_ERROR_WANT_READ — normal, not an error */
+                                fp_err("CAP_PROCESS B0: TLS decryption error: %s", err->message);
+                                g_error_free (err);
                             }
-                            if (err) g_error_free (err);
                         }
                         g_byte_array_remove_range (sb, 0, pkt_len);
 
@@ -1887,15 +2003,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
                         fp_dbg("CAP_PROCESS B2: decode_img returned tls=%p, tls_len=%u", tls, tls_len);
                         if (tls && tls_len > 0) {
                             goodix_gm168_tls_feed (&self->tls, tls, tls_len);
-                            guint8 dec[GOODIX_GM168_EP_IN_SIZE];
+                            guint8 *dec = self->tls_dec_buf;
                             GError *err = NULL;
-                            int dec_n = goodix_gm168_tls_recv (&self->tls, dec, sizeof(dec), &err);
+                            int dec_n = goodix_gm168_tls_recv (&self->tls, dec, GOODIX_GM168_EP_IN_SIZE, &err);
                             if (dec_n > 0) {
                                 append_to_buf (self, dec, dec_n);
-                            } else {
-                                fp_err("CAP_PROCESS B2: TLS decryption error: %s", err ? err->message : "unknown (dec_n<=0)");
+                            } else if (err) {
+                                /* dec_n==0 with err==NULL is SSL_ERROR_WANT_READ — normal, not an error */
+                                fp_err("CAP_PROCESS B2: TLS decryption error: %s", err->message);
+                                g_error_free (err);
                             }
-                            if (err) g_error_free (err);
 
                             /* Accumulate until the full TLS plaintext frame
                              * has been decrypted (one frame can arrive across
@@ -1943,6 +2060,15 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+/* qsort comparator for float arrays (used in CLAHE percentile-clip path). */
+static int
+cmp_float_asc (const void *a, const void *b)
+{
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
 static void
 capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
@@ -1963,18 +2089,25 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
          * has a viable best from earlier attempts within this touch,
          * submit it instead of dropping the whole stage with an error —
          * this is the only thing that keeps us going when the sensor
-         * stops answering after one bad/saturated frame mid-retry. */
-        if (self->best_img) {
-            FpImage *to_submit  = self->best_img;
-            gfloat   submit_q   = self->best_quality;
-            int      submit_n   = self->capture_attempt;
-            self->best_img      = NULL;
-            self->best_quality  = 0.0f;
-            self->capture_attempt = 0;
+         * stops answering after one bad/saturated frame mid-retry.
+         * Also covers dual-capture: if dual #2 errored but #1 is in
+         * dual_pending_img, submit #1. */
+        FpImage *fallback = self->best_img ? self->best_img
+                                           : self->dual_pending_img;
+        gfloat   fallback_q = self->best_img ? self->best_quality
+                                             : self->dual_pending_quality;
+        if (fallback) {
+            self->best_img             = NULL;
+            self->best_quality         = 0.0f;
+            self->dual_pending_img     = NULL;
+            self->dual_pending_quality = 0.0f;
+            self->dual_in_second       = FALSE;
+            int submit_n               = self->capture_attempt;
+            self->capture_attempt      = 0;
             fp_warn ("quality-gate: capture errored mid-retry — submit best q=%.2f after %d attempts (%s)",
-                     submit_q, submit_n, error->message);
+                     fallback_q, submit_n, error->message);
             g_error_free (error);
-            start_rearm_ssm (self, NULL, to_submit);
+            start_rearm_ssm (self, NULL, fallback);
             return;
         }
         fpi_image_device_session_error (img_dev, error);
@@ -2015,6 +2148,7 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
 
         FpImage *fp_img = fp_image_new (GM168_FRAME_W, GM168_FRAME_H);
         fp_img->flags = FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
+        fp_img->ppmm = 19.685f; /* 500 DPI — required by NBIS MINDTCT */
 
         /* Default path: envelope-based local contrast stretch (matches the
          * Windows preprocessor byte-for-byte on test captures, modulo the
@@ -2064,12 +2198,9 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
          *      which left the per-tile std too low for NBIS minutiae work. */
         float *sorted = g_new (float, GM168_FRAME_PIXELS);
         memcpy (sorted, tmp_buf, sizeof (float) * GM168_FRAME_PIXELS);
-        for (int a = 0; a < GM168_FRAME_PIXELS - 1; a++) {
-            int mi = a;
-            for (int b = a + 1; b < GM168_FRAME_PIXELS; b++)
-                if (sorted[b] < sorted[mi]) mi = b;
-            float tmp = sorted[a]; sorted[a] = sorted[mi]; sorted[mi] = tmp;
-        }
+        /* qsort (O(n log n)) replaces the old O(n²) selection sort that
+         * took ~13M comparisons per frame in the CLAHE percentile-clip path. */
+        qsort (sorted, GM168_FRAME_PIXELS, sizeof (float), cmp_float_asc);
         int lo_idx = (int)(GM168_FRAME_PIXELS * 0.02f);
         int hi_idx = (int)(GM168_FRAME_PIXELS * 0.98f);
         float vlo = sorted[lo_idx];
@@ -2185,21 +2316,65 @@ post_process_done:
 
         if (!accept && self->best_img) {
             /* Retry: short rearm, then another capture cycle. */
+            GM168_LOG_CAP (&self->log, "best=%.2f  att=%d  %lldms  → RETRY",
+                           self->best_quality, self->capture_attempt, (long long)elapsed);
             start_rearm_retry_ssm (self);
             return;
         }
 
-        /* Accept: submit best, reset state for next touch. */
-        FpImage *to_submit  = self->best_img;
-        self->best_img      = NULL;
-        gfloat   submit_q   = self->best_quality;
-        int      submit_n   = self->capture_attempt;
-        self->best_quality  = 0.0f;
-        self->capture_attempt = 0;
+        /* Dual-capture: after the first quality-accepted frame, fire a
+         * second SCAN_TRIG WITHOUT rearm — finger is still on the sensor,
+         * FDT is already consumed by the first capture.  This matches the
+         * Windows enroll pattern observed in patches/goodix.pcapng and
+         * doubles the minutiae coverage per touch. */
+        if (!self->dual_in_second) {
+            int attempts_so_far = self->capture_attempt;
+            self->dual_pending_img     = self->best_img;
+            self->dual_pending_quality = self->best_quality;
+            self->best_img             = NULL;
+            self->best_quality         = 0.0f;
+            self->capture_attempt      = 0;
+            self->dual_in_second       = TRUE;
+            GM168_LOG_CAP (&self->log,
+                           "q=%.2f  att=%d  %lldms  → DUAL #1, capturing #2",
+                           self->dual_pending_quality, attempts_so_far,
+                           (long long)elapsed);
+            start_capture_ssm (self);
+            return;
+        }
+
+        /* Second capture done — pick the better of the two. */
+        self->dual_in_second = FALSE;
+        FpImage *to_submit;
+        gfloat   submit_q;
+        if (self->best_quality > self->dual_pending_quality) {
+            to_submit = self->best_img;
+            submit_q  = self->best_quality;
+            if (self->dual_pending_img)
+                g_object_unref (self->dual_pending_img);
+            GM168_LOG_CAP (&self->log,
+                           "dual: pick #2  q=%.2f  (#1=%.2f dropped)",
+                           submit_q, self->dual_pending_quality);
+        } else {
+            to_submit = self->dual_pending_img;
+            submit_q  = self->dual_pending_quality;
+            if (self->best_img)
+                g_object_unref (self->best_img);
+            GM168_LOG_CAP (&self->log,
+                           "dual: pick #1  q=%.2f  (#2=%.2f dropped)",
+                           submit_q, self->best_quality);
+        }
+        self->best_img             = NULL;
+        self->best_quality         = 0.0f;
+        self->dual_pending_img     = NULL;
+        self->dual_pending_quality = 0.0f;
+        self->capture_attempt      = 0;
 
         if (to_submit) {
-            fp_warn ("quality-gate: SUBMIT quality=%.2f after %d attempts in %lldms",
-                     submit_q, submit_n, (long long)elapsed);
+            fp_warn ("quality-gate: SUBMIT (best of dual) quality=%.2f",
+                     submit_q);
+            self->log.last_quality = submit_q;
+            GM168_LOG_CAP (&self->log, "q=%.2f  → SUBMIT", submit_q);
             start_rearm_ssm (self, NULL, to_submit);
         } else {
             /* Should not happen — first attempt always saves the frame as
@@ -2287,15 +2462,22 @@ poll_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *er
             transfer->actual_length >= GOODIX_GM168_TOUCH_PKT_LEN &&
             goodix_gm168_is_touch_event (buf, transfer->actual_length)) {
             fp_dbg ("*** Touch Detected (A0 echo=0x32 status=0x02) ***");
+            gm168_log_touch_divider (&self->log);
             /* Fresh touch → reset quality-gate state. Previous best (if
              * any leaked through e.g. a deactivate mid-retry) is freed. */
             if (self->best_img) {
                 g_object_unref (self->best_img);
                 self->best_img = NULL;
             }
-            self->best_quality      = 0.0f;
-            self->capture_attempt   = 0;
-            self->capture_start_us  = g_get_monotonic_time ();
+            if (self->dual_pending_img) {
+                g_object_unref (self->dual_pending_img);
+                self->dual_pending_img = NULL;
+            }
+            self->best_quality         = 0.0f;
+            self->dual_pending_quality = 0.0f;
+            self->dual_in_second       = FALSE;
+            self->capture_attempt      = 0;
+            self->capture_start_us     = g_get_monotonic_time ();
 
             fpi_image_device_report_finger_status (img_dev, TRUE);
             start_capture_ssm (self);
@@ -2344,8 +2526,8 @@ start_polling(FpDeviceGoodixGm168 *self)
 static gfloat
 gm168_quality_metric (const guint8 *img)
 {
-    const int x0 = 8, x1 = 56;   /* central 48 cols out of 64 */
-    const int y0 = 8, y1 = 72;   /* central 64 rows out of 80 */
+    const int x0 = 16, x1 = 64;  /* central 48 cols out of W=80 */
+    const int y0 = 8,  y1 = 56;  /* central 48 rows out of H=64 */
     const int n  = (x1 - x0) * (y1 - y0);
     guint32 sum = 0;
     int sat_lo = 0, sat_hi = 0;
@@ -2383,6 +2565,7 @@ enum rearm_states {
     REARM_AE_ACK,
     REARM_32,
     REARM_32_ACK,
+    REARM_WAIT_LIFT,
     REARM_NUM_STATES
 };
 
@@ -2393,8 +2576,128 @@ struct RearmData {
     /* TRUE = quality-gate wants another capture: skip finger-off report,
      * skip image_captured, just re-arm and start_capture_ssm again. */
     gboolean retry;
+    /* TRUE = wait_lift_cb saw an FDT touch event (quick-tap), meaning
+     * the FDT fired and was consumed.  On timeout we must jump back to
+     * REARM_32 to re-arm FDT; without this start_polling listens on a
+     * dead FDT and the sensor appears frozen.                          */
+    gboolean consumed_touch;
+    /* Number of times wait_lift_cb has already jumped back to REARM_32.
+     * Capped at GM168_WAIT_LIFT_MAX_REARMS to break the residual-
+     * capacitance loop where FDT re-fires immediately after every re-arm. */
+    gint rearm32_count;
+    /* Set when cap is reached: re-arm FDT in REARM_32 then skip the
+     * wait_lift loop entirely.  Ensures polling starts with FDT armed. */
+    gboolean fdt_rearm_only;
 };
 
+
+/* Submitted from REARM_WAIT_LIFT: re-listen while finger is present.
+ * Advances SSM on timeout (finger gone) or explicit non-touch FDT packet. */
+static void
+wait_lift_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+    FpDeviceGoodixGm168 *self = FPI_DEVICE_GOODIX_GM168 (dev);
+
+    if (error) {
+        if (gm168_handle_fatal_usb_error (self, transfer->ssm, &error, "wait_lift_cb"))
+            return;
+        if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT)) {
+            g_error_free (error);
+            fp_dbg ("wait_lift: timeout — finger gone");
+            /* If we consumed a touch event (FDT fired for a quick-tap),
+             * the FDT is now disarmed.  Polling on a dead FDT means the
+             * sensor will never deliver another touch event — the driver
+             * appears frozen.  Jump back to REARM_32 to re-arm the FDT
+             * before completing REARM.                                   */
+            struct RearmData *rd = fpi_ssm_get_data (transfer->ssm);
+            if (rd && rd->consumed_touch) {
+                rd->consumed_touch = FALSE;
+                if (rd->rearm32_count < GM168_WAIT_LIFT_MAX_REARMS) {
+                    rd->rearm32_count++;
+                    fp_dbg ("wait_lift: FDT consumed — re-arming REARM_32 (retry %d/%d)",
+                            rd->rearm32_count, GM168_WAIT_LIFT_MAX_REARMS);
+                    GM168_LOG_LIFT (&self->log, "✓ gone (FDT consumed) — re-arm");
+                    fpi_ssm_jump_to_state (transfer->ssm, REARM_32);
+                } else {
+                    /* Cap reached: FDT is currently consumed (disarmed).
+                     * Must re-arm it before completing REARM, otherwise
+                     * start_polling waits forever on a dead FDT.
+                     * Set fdt_rearm_only so REARM_WAIT_LIFT skips the
+                     * wait and completes immediately after REARM_32.  */
+                    fp_dbg ("wait_lift: FDT cap reached — re-arming FDT then completing");
+                    GM168_LOG_LIFT (&self->log, "✓ gone (FDT cap — re-arm then done)");
+                    rd->fdt_rearm_only = TRUE;
+                    fpi_ssm_jump_to_state (transfer->ssm, REARM_32);
+                }
+            } else {
+                GM168_LOG_LIFT (&self->log, "✓ finger gone");
+                fpi_ssm_next_state (transfer->ssm);
+            }
+            return;
+        }
+        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            /* fpi_ssm_mark_failed takes ownership of error — no need to free+alloc */
+            fpi_ssm_mark_failed (transfer->ssm, error);
+            return;
+        }
+        fpi_ssm_mark_failed (transfer->ssm, error);
+        return;
+    }
+
+    /* G1 (freeze fix): The REARM deadline is normally checked at the top of
+     * rearm_run_state(), i.e. only on state transitions.  wait_lift_cb
+     * re-submits itself without advancing the SSM, so rapid or continuous
+     * touches loop here forever — the deadline check in rearm_run_state
+     * is never reached and the driver hangs indefinitely.
+     *
+     * Mirror the deadline check here so we bail out even when no state
+     * transition has happened.  On expiry gm168_ssm_deadline_expired marks
+     * the SSM failed, which fires rearm_completed(error) → start_recover_ssm
+     * → recover_completed → start_polling, recovering the sensor.          */
+    if (gm168_ssm_deadline_expired (self, transfer->ssm, "wait_lift")) return;
+
+    const guint8 *buf = transfer->buffer;
+    guint32 len = transfer->actual_length;
+
+    if (goodix_gm168_is_touch_event (buf, len)) {
+        /* Finger on sensor (or quick-tap): FDT just fired and was consumed
+         * by this read.  Set consumed_touch so the timeout path knows to
+         * re-arm FDT (REARM_32) before completing REARM.                 */
+        struct RearmData *rd = fpi_ssm_get_data (transfer->ssm);
+        if (rd) rd->consumed_touch = TRUE;
+        /* Log channel capacitance values so we can distinguish real touch
+         * from residual capacitance — bytes 11..22 of the 24-byte FDT pkt
+         * are 6 × uint16-LE channel readings.                             */
+        if (len >= GOODIX_GM168_TOUCH_PKT_LEN) {
+            guint16 ch0 = buf[11] | ((guint16)buf[12] << 8);
+            guint16 ch1 = buf[13] | ((guint16)buf[14] << 8);
+            guint16 ch2 = buf[15] | ((guint16)buf[16] << 8);
+            fp_dbg ("wait_lift: FDT touch  ch0=%u ch1=%u ch2=%u", ch0, ch1, ch2);
+            GM168_LOG_LIFT (&self->log, "⚡ FDT touch  ch0=%u ch1=%u ch2=%u", ch0, ch1, ch2);
+        } else {
+            GM168_LOG_LIFT (&self->log, "⚡ FDT consumed (short pkt len=%u)", len);
+        }
+    } else if (len >= GOODIX_GM168_TOUCH_PKT_LEN &&
+               buf[0] == GOODIX_GM168_PKT_CMD &&
+               buf[GOODIX_GM168_TOUCH_ECHO_OFF] == GOODIX_GM168_CMD_FDT_SETUP) {
+        /* FDT packet with non-touch status — explicit lift signal */
+        fp_dbg ("wait_lift: FDT lift  status=0x%02X", buf[GOODIX_GM168_TOUCH_STATUS_OFF]);
+        GM168_LOG_LIFT (&self->log, "✓ FDT lift  status=0x%02X", buf[GOODIX_GM168_TOUCH_STATUS_OFF]);
+        fpi_ssm_next_state (transfer->ssm);
+        return;
+    } else {
+        /* Some other packet (FINAL ACK, B0, etc.) — drain and re-listen */
+        fp_dbg ("wait_lift: draining non-FDT packet (type=0x%02X len=%u)",
+                len > 0 ? buf[0] : 0, len);
+    }
+
+    FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+    fpi_usb_transfer_fill_bulk (t, GOODIX_GM168_EP_IN, GOODIX_GM168_EP_IN_SIZE);
+    t->ssm = transfer->ssm;
+    t->short_is_error = FALSE;
+    fpi_usb_transfer_submit (t, GM168_WAIT_LIFT_POLL_MS,
+                             self->io_cancellable, wait_lift_cb, NULL);
+}
 
 static void
 rearm_run_state (FpiSsm *ssm, FpDevice *dev)
@@ -2448,6 +2751,33 @@ rearm_run_state (FpiSsm *ssm, FpDevice *dev)
         case REARM_32_ACK:
             async_recv_ack(ssm, dev, GM168_USB_RX_TIMEOUT_MS);
             break;
+        case REARM_WAIT_LIFT:
+            {
+                struct RearmData *rd = fpi_ssm_get_data (ssm);
+                if (rd && rd->retry) {
+                    /* Quality-gate retry: finger is deliberately kept on.
+                     * Skip lift-wait so we go directly to another capture. */
+                    fpi_ssm_next_state (ssm);
+                    break;
+                }
+                if (rd && rd->fdt_rearm_only) {
+                    /* FDT cap was reached: REARM_32 just re-armed the FDT.
+                     * Complete REARM immediately — polling will fire on the
+                     * next real touch without waiting here. */
+                    GM168_LOG_LIFT (&self->log, "✓ FDT re-armed, completing REARM");
+                    fpi_ssm_next_state (ssm);
+                    break;
+                }
+                fp_dbg ("wait_lift: watching for finger release");
+                GM168_LOG_LIFT (&self->log, "watching…");
+                FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+                fpi_usb_transfer_fill_bulk (t, GOODIX_GM168_EP_IN, GOODIX_GM168_EP_IN_SIZE);
+                t->ssm = ssm;
+                t->short_is_error = FALSE;
+                fpi_usb_transfer_submit (t, GM168_WAIT_LIFT_POLL_MS,
+                                         self->io_cancellable, wait_lift_cb, NULL);
+            }
+            break;
         default:
             g_assert_not_reached ();
     }
@@ -2471,6 +2801,7 @@ rearm_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
          * In the meantime report finger-off so libfprint isn't holding
          * the "finger on" state through recovery.                          */
         fp_warn ("Rearm failed: %s — escalating to RECOVER", error->message);
+        GM168_LOG_ERR (&self->log, "REARM failed: %s — escalating to RECOVER", error->message);
         g_error_free (error);
         /* Free any submitted-image data RearmData was holding — recover
          * means we're discarding this capture cycle.                       */
@@ -2492,6 +2823,22 @@ rearm_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
         return;
     }
 
+    /* Normal submit path — log REARM completion and stage result. */
+    {
+        double ms = (self->log.rearm_start_us > 0)
+                  ? (g_get_monotonic_time () - self->log.rearm_start_us) / 1000.0
+                  : 0.0;
+        GM168_LOG_REARM (&self->log, "✓ armed  (%.0f ms)", ms);
+        if (rd->img) {
+            self->log_stage_count++;
+            GM168_LOG_STAGE (&self->log, "#%d  q=%.2f  ✓",
+                             self->log_stage_count, self->log.last_quality);
+        } else if (rd->err) {
+            GM168_LOG_STAGE (&self->log, "#%d  ✗  (%s)",
+                             self->log_stage_count + 1, rd->err->message);
+        }
+    }
+
     fpi_image_device_report_finger_status(img_dev, FALSE);
 
     if (rd->err) {
@@ -2509,6 +2856,8 @@ rearm_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
 static void
 start_rearm_ssm(FpDeviceGoodixGm168 *self, GError *enroll_err, FpImage *img)
 {
+    self->log.rearm_start_us = g_get_monotonic_time ();
+    GM168_LOG_REARM (&self->log, "▶");
     gm168_ssm_deadline_set (self, GM168_REARM_DEADLINE_MS);
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (self), rearm_run_state, REARM_NUM_STATES);
     struct RearmData *rd = g_malloc0(sizeof(struct RearmData));
@@ -2526,6 +2875,8 @@ start_rearm_ssm(FpDeviceGoodixGm168 *self, GError *enroll_err, FpImage *img)
 static void
 start_rearm_retry_ssm(FpDeviceGoodixGm168 *self)
 {
+    self->log.rearm_start_us = g_get_monotonic_time ();
+    GM168_LOG_REARM (&self->log, "▶ (retry)");
     gm168_ssm_deadline_set (self, GM168_REARM_DEADLINE_MS);
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (self), rearm_run_state, REARM_NUM_STATES);
     struct RearmData *rd = g_malloc0(sizeof(struct RearmData));
@@ -2650,11 +3001,13 @@ recover_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
 
     if (error) {
         fp_warn ("RECOVER failed: %s — surfacing to libfprint", error->message);
+        GM168_LOG_ERR (&self->log, "RECOVER failed: %s", error->message);
         fpi_image_device_session_error (img_dev, error);
         return;
     }
 
-    fp_warn ("RECOVER OK — sensor back to touch-wait, resuming polling");
+    fp_dbg ("RECOVER OK — sensor back to touch-wait, resuming polling");
+    GM168_LOG_RECOV (&self->log, "✓ sensor recovered — resuming polling");
     /* Quality-gate state was tied to a touch that recover interrupted —
      * drop it so the next touch starts fresh.                           */
     g_clear_object (&self->best_img);
@@ -2670,6 +3023,7 @@ static void
 start_recover_ssm (FpDeviceGoodixGm168 *self)
 {
     fp_warn ("starting RECOVER SSM");
+    GM168_LOG_RECOV (&self->log, "▶ sensor stuck — starting RECOVER");
     gm168_ssm_deadline_set (self, GM168_RECOVER_DEADLINE_MS);
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (self), recover_run_state, RECOVER_NUM_STATES);
     fpi_ssm_start (ssm, recover_completed);
@@ -2690,9 +3044,12 @@ static void dev_activate (FpImageDevice *dev)
 
     /* Quality-gate state: drop any leftover best from a prior session. */
     g_clear_object (&self->best_img);
-    self->best_quality      = 0.0f;
-    self->capture_attempt   = 0;
-    self->capture_start_us  = 0;
+    g_clear_object (&self->dual_pending_img);
+    self->best_quality         = 0.0f;
+    self->dual_pending_quality = 0.0f;
+    self->dual_in_second       = FALSE;
+    self->capture_attempt      = 0;
+    self->capture_start_us     = 0;
 
     /* G8: fresh cancellable per activate. g_clear_object first guards
      * against re-activate without dev_deactivate (e.g. fprintd restart). */
@@ -2701,6 +3058,8 @@ static void dev_activate (FpImageDevice *dev)
 
     if (!self->stitch_buf)
         self->stitch_buf = g_byte_array_new();
+    if (!self->tls_dec_buf)
+        self->tls_dec_buf = g_malloc (GOODIX_GM168_EP_IN_SIZE);
 
     /* G7: trace timer reset for this activate. */
     gm168_trace_init (&self->trace);
@@ -2718,6 +3077,8 @@ static void dev_activate (FpImageDevice *dev)
      * and we're ready immediately.                                       */
     if (self->tls.ssl != NULL && self->tls_done && self->background != NULL) {
         fp_dbg ("dev_activate: fast path — TLS+BG cached, skipping init");
+        self->log_stage_count = 0;
+        GM168_LOG_INIT (&self->log, "▶ fast path — TLS+BG cached");
         fpi_image_device_activate_complete (dev, NULL);
         return;
     }
@@ -2764,6 +3125,8 @@ static void dev_activate (FpImageDevice *dev)
         return;
     }
 
+    self->log.init_start_us = g_get_monotonic_time ();
+    GM168_LOG_INIT (&self->log, "▶ full init");
     gm168_ssm_deadline_set (self, GM168_INIT_DEADLINE_MS);
     FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), init_run_state, INIT_NUM_STATES);
     fpi_ssm_start (ssm, init_completed);
@@ -2790,9 +3153,9 @@ static void dev_deactivate (FpImageDevice *dev)
      * cycles deactivate→activate between enroll stages, and the sensor's
      * TLS session is reusable across that cycle — tearing it down forces
      * a full re-handshake which the sensor refuses (it stays in its old
-     * TLS state and ignores TLS_START). tls_cancel still runs from
-     * dev_close (full teardown), and the fast path in dev_activate
-     * picks up the live session.                                          */
+     * TLS state and ignores TLS_START). The fast path in dev_activate
+     * picks up the live session; full cleanup happens in the GObject
+     * finalizer when the device object is destroyed.                      */
 
     /* G10 (H5, M4): drop transient capture state. We don't free img_buf /
      * stitch_buf here because they're reused on the next activate (sized
@@ -2831,6 +3194,9 @@ static void dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
 static void dev_open (FpImageDevice *dev)
 {
+    FpDeviceGoodixGm168 *self = FPI_DEVICE_GOODIX_GM168 (dev);
+    gm168_log_open (&self->log);
+
     GError *error = NULL;
     g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
     /* Since dev_close keeps the interface claimed, a re-open may see
@@ -2845,6 +3211,9 @@ static void dev_open (FpImageDevice *dev)
 
 static void dev_close (FpImageDevice *dev)
 {
+    FpDeviceGoodixGm168 *self = FPI_DEVICE_GOODIX_GM168 (dev);
+    gm168_log_close (&self->log);
+
     /* Do NOT tear down TLS or release the USB interface here. The sensor
      * preserves its TLS session indefinitely on its side; if we tear down
      * ours, the next dev_open's TLS_START gets stale encrypted records
@@ -2865,10 +3234,28 @@ static void fpi_device_goodix_gm168_init (FpDeviceGoodixGm168 *self)
 {
 }
 
+static void
+fpi_device_goodix_gm168_finalize (GObject *obj)
+{
+    FpDeviceGoodixGm168 *self = FPI_DEVICE_GOODIX_GM168 (obj);
+    if (self->tls.ssl)
+        goodix_gm168_tls_deinit (&self->tls);
+    g_clear_pointer (&self->stitch_buf, g_byte_array_unref);
+    g_clear_pointer (&self->img_buf, g_free);
+    g_clear_pointer (&self->background, g_free);
+    g_clear_pointer (&self->background_sum, g_free);
+    g_clear_pointer (&self->tls_dec_buf, g_free);
+    g_clear_object (&self->best_img);
+    g_clear_object (&self->dual_pending_img);
+    g_clear_object (&self->io_cancellable);
+    G_OBJECT_CLASS (fpi_device_goodix_gm168_parent_class)->finalize (obj);
+}
+
 static void fpi_device_goodix_gm168_class_init (FpDeviceGoodixGm168Class *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
   FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
+  G_OBJECT_CLASS (klass)->finalize = fpi_device_goodix_gm168_finalize;
 
   dev_class->id = "goodix_gm168";
   dev_class->full_name = "Goodix GM168";

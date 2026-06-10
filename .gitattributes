@@ -1,0 +1,14 @@
+# Force LF on Linux-target files regardless of editor/OS settings.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.md    text eol=lf
+
+# Build files
+meson.build  text eol=lf
+meson.options text eol=lf
+
+# Windows-only files keep CRLF.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf

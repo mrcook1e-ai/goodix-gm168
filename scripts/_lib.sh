@@ -40,9 +40,14 @@ gm168_kill_old_sessions () {
 }
 
 # Re-open USB perms (usbipd-attached devices come up root:root).
+# Finds the GM168 (27c6:589a) dynamically via lsusb — works regardless of
+# which bus/port the device ends up on after a replug or reboot.
 gm168_unlock_usb () {
-    if [[ -e /dev/bus/usb/001/002 ]]; then
-        sudo -n chmod 666 /dev/bus/usb/001/002 2>/dev/null || true
+    local node
+    node=$(lsusb -d 27c6:589a 2>/dev/null | \
+           awk '{printf "/dev/bus/usb/%s/%s\n", $2, substr($4,1,3)}' | head -1)
+    if [[ -n "$node" && -e "$node" ]]; then
+        sudo -n chmod 666 "$node" 2>/dev/null || true
     fi
 }
 

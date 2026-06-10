@@ -48,23 +48,23 @@ struct _GoodixGM168TlsServer {
     volatile gboolean cancel_requested;
 };
 
-// Инициализация TLS сервера. Запускает поток ожидания handshake.
-// on_connected вызывается когда handshake завершён (error=NULL) или упал (error!=NULL)
+// Initialize TLS server. Starts the handshake-wait thread.
+// on_connected is called when the handshake completes (error=NULL) or fails (error!=NULL).
 gboolean goodix_gm168_tls_init    (GoodixGM168TlsServer *self, GError **error);
 
-// Передать сырые TLS байты от MCU (из B0 пакета) в OpenSSL
+// Feed raw TLS bytes from the MCU (from a B0 packet) into OpenSSL.
 int      goodix_gm168_tls_feed    (GoodixGM168TlsServer *self, const guint8 *data,
                                     guint32 length);
 
-// Забрать TLS байты которые нужно отправить MCU (обернуть в B0 и послать)
+// Pull TLS bytes that OpenSSL wants to send to the MCU (wrap in B0 and send).
 int      goodix_gm168_tls_pull    (GoodixGM168TlsServer *self, guint8 *buf,
                                     guint16 size);
 
-// Прочитать расшифрованные данные от MCU (после handshake)
+// Read decrypted data from the MCU (after handshake completes).
 int      goodix_gm168_tls_recv    (GoodixGM168TlsServer *self, guint8 *buf,
                                     guint32 size, GError **error);
 
-// Зашифровать и отправить данные MCU
+// Encrypt and send data to the MCU.
 int      goodix_gm168_tls_send    (GoodixGM168TlsServer *self, const guint8 *data,
                                     guint16 length);
 
@@ -73,5 +73,5 @@ int      goodix_gm168_tls_send    (GoodixGM168TlsServer *self, const guint8 *dat
 // goodix_gm168_tls_deinit can finish without blocking.
 void     goodix_gm168_tls_cancel  (GoodixGM168TlsServer *self);
 
-// Дестрой
+// Tear down TLS state and join the serve thread.
 void     goodix_gm168_tls_deinit  (GoodixGM168TlsServer *self);

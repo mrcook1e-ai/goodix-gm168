@@ -13,7 +13,11 @@ threads_dep = dependency('threads')
 sources = [
   'goodix_gm168.c',
   'goodix_proto.c',
-  'goodix_tls.c'
+  'goodix_tls.c',
+  'goodix_tls_prf.c',
+  'goodix_tls_record.c',
+  'goodix_tls_handshake.c',
+  'gm168_log.c',
 ]
 
 shared_library('fprint-goodix-gm168',

@@ -13,8 +13,8 @@
 # Output: logs/grid-<TS>.png and logs/grid-<TS>/ (raw dumps).
 set -euo pipefail
 
-REMOTE_HOST="${GM168_HOST:-mrcook1e@192.168.1.14}"
-REMOTE_PORT="${GM168_PORT:-2200}"
+REMOTE_HOST="${GM168_HOST:-mrcook1e@192.168.1.23}"
+REMOTE_PORT="${GM168_PORT:-22}"
 REMOTE_DIR="${GM168_REMOTE_DIR:-/home/mrcook1e/dev/goodix-gm168}"
 BUILD_DIR_REMOTE="${GM168_REMOTE_BUILD:-/home/mrcook1e/dev/libfprint-build}"
 

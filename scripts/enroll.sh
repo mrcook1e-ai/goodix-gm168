@@ -18,14 +18,23 @@ GM168_DIR="${GOODIX_GM168_DIR:-$HOME/.goodix-gm168}"
 mkdir -p "$REPO_DIR/logs" "$GM168_DIR"
 LOG="$REPO_DIR/logs/$(date +%Y%m%d-%H%M%S)-enroll.log"
 
+# In debug mode: delegate to enroll_grid.sh — it collects per-stage images
+# and assembles them into an annotated PNG grid automatically.
+if [[ "${GM168_DEBUG:-0}" == "1" ]]; then
+    echo "[enroll] GM168_DEBUG=1 → handing off to enroll_grid.sh"
+    exec "$(dirname "$0")/enroll_grid.sh" "$@"
+fi
+
 # shellcheck disable=SC1091
 source "$(dirname "$0")/_lib.sh"
 gm168_kill_old_sessions
 gm168_unlock_usb
 gm168_set_default_env
 
-# Clean per-frame dumps so this run's output is isolated.
-rm -f /tmp/gm168_*.bin 2>/dev/null || true
+# Frame dumps (/tmp/gm168_*.pgm/.bin) are only produced by a GM168_DEBUG
+# build (scripts/grid_dumps.sh debug-build). Clean stale dumps anyway so
+# timestamps don't confuse grid_dumps.py if a debug build is active.
+rm -f /tmp/gm168_*.bin /tmp/gm168_*.pgm 2>/dev/null || true
 
 echo "[enroll] log → $LOG"
 echo "[enroll] starting libfprint examples/enroll — interactive"
@@ -41,4 +50,6 @@ env \
 
 echo
 echo "[enroll] done — log: $LOG"
-echo "[enroll] frame dumps: /tmp/gm168_*.bin"
+# Frame dumps only exist if built with -DGM168_DEBUG (see grid_dumps.sh debug-build).
+[[ -n "$(ls /tmp/gm168_*.pgm 2>/dev/null)" ]] && \
+    echo "[enroll] frame dumps: $(ls /tmp/gm168_*.pgm 2>/dev/null | wc -l) files in /tmp/gm168_*.pgm"
