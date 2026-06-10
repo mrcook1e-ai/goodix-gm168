@@ -9,7 +9,8 @@ index 0ca1767..11dc4e4 100644
 +    'goodix_gm168' :
 +        [ 'drivers/goodix_gm168/goodix_gm168.c',
 +          'drivers/goodix_gm168/goodix_proto.c',
-+          'drivers/goodix_gm168/goodix_tls.c' ],
++          'drivers/goodix_gm168/goodix_tls.c',
++          'drivers/goodix_gm168/gm168_log.c' ],
      'fpcmoc' :
          [ 'drivers/fpcmoc/fpc.c' ],
      'realtek' :
