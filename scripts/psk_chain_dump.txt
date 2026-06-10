@@ -1,0 +1,286 @@
+PSK CHAIN DUMP — Wbdi.dll
+========================================================================
+Generated via Binary Ninja MCP (manual traversal)
+File: C:/Users/mrcook1e/Fingerprint/raw/Wbdi.dll.bndb
+========================================================================
+
+════════════════════════════════════════════════════════════════════════
+CRITICAL FINDING: "GfSealData" uses CryptProtectData (Windows DPAPI),
+NOT Intel SGX sealing. The SGX enclave name WbdiEnclave.signed.dll is
+misleading — actual blob protection on this path is DPAPI + WhiteBox.
+════════════════════════════════════════════════════════════════════════
+
+
+========================================================================
+CALL GRAPH SUMMARY
+========================================================================
+
+  ProcessPsk [Geneva]  (sub_1800952d0)
+    → sub_1800a0710         (get MCU firmware version)
+    → sub_18009fc94         (parse firmware version string)
+    → sub_180038ad0         (GfSealData = CryptProtectData !!)
+    → sub_18003aba8         (noop — zeros two ints)
+    → sub_18003a2e4         (PresetPskWriteKey)
+    → sub_180038ea8         (check PSK valid in MCU)
+
+  ProcessPsk [Realtek]  (sub_1800a7e10)
+    → sub_1800a948c         (Realtek-specific init)
+    → sub_1800a0710         (get MCU firmware version)
+    → sub_18009fc94         (parse firmware version)
+    → sub_180038ad0         (GfSealData = CryptProtectData)
+    → sub_18003aba8         (noop)
+    → sub_18003a2e4         (PresetPskWriteKey)
+    → sub_1800394b0         (check PSK valid — Realtek)
+
+  PresetPskWriteKey  (sub_18003a2e4)
+    → sub_18003836c         (GeneratePsk = CryptGenRandom 32B)
+    → sub_180001000         (SecWhiteEncrypt / WhiteBox AES-CBC)
+    → sub_180038ad0         (GfSealData = CryptProtectData)
+    → sub_180097a6c         (PresetPskWriteG — GM168 path)
+    → sub_1800a9f14         (PresetPskWriteR — Realtek path)
+
+  GeneratePsk  (sub_18003836c)
+    → CryptAcquireContextW("GoodixKeyContainer")
+    → CryptGenRandom(32)    ← raw 32-byte PSK
+
+  SecWhiteEncrypt  (sub_180001000)
+    → sub_180004e50         (wb_ctx_alloc)
+    → sub_180004f10         (wb_ctx_init — hardcoded SHA-256 H0-H7)
+    → sub_180004e20         (wb_update — SHA-256 update wrapper)
+    → sub_180006b10         (wb_finalize — SHA-256 big-endian output)
+    → mbedtls_aes_setkey_enc
+    → mbedtls_aes_crypt_cbc  (AES-128-CBC encrypt)
+
+  GfSealData  (sub_180038ad0)   ← "SGX" is a LIE
+    → CryptProtectData(dataIn, "This is the description string.", ...)
+    → memcpy(out, dataOut.pbData, dataOut.cbData)
+    → LocalFree(dataOut.pbData)
+
+  PresetPskWriteG  (sub_180097a6c)
+    → calloc(len + 0xa)     (build packet: 10-byte header + PSK blob)
+    → calloc(0x200)         (response buffer)
+    → sub_1800783f0(..., 0xe0, ...)  (send USB cmd 0xE0)
+    → sub_1800783f0(..., 0xe4, ...)  (send USB cmd 0xE4)
+
+  PresetPskReadG  (sub_180097458)
+    → sub_1800783f0(..., 0xe4, ...)  (read USB cmd 0xE4)
+    (returns raw MCU blob in chunks)
+
+  PresetPskPskSet  (sub_1800a45b8)
+    → memcpy(*(arg1+0xe0), arg2, arg3)  (in-memory PSK cache)
+
+  wb_ctx_init  (sub_180004f10) — hardcoded SHA-256 H0-H7:
+    67 e6 09 6a  85 ae 67 bb  72 f3 6e 3c  3a f5 4f a5
+    7f 52 0e 51  8c 68 05 9b  ab d9 83 1f  19 cd e0 5b
+    (standard SHA-256 initial values for H0..H7)
+
+  wb_update  (sub_180006a30) — SHA-256 block update (64-byte chunks)
+  wb_finalize (sub_180006b10) — SHA-256 finalize, big-endian byte output
+
+
+========================================================================
+FUNCTION DECOMPILATIONS
+========================================================================
+
+────────────────────────────────────────────────────────────────────────
+sub_180038ad0  GfSealData  (source: pskunify.c:GfSealData)
+────────────────────────────────────────────────────────────────────────
+180038b50  dataIn.pbData = arg1
+180038b59  dataIn.cbData = arg2
+180038b5d  dataOut.cbData = 0
+180038b65  dataOut.pbData = 0
+180038ba2  if (CryptProtectData(&dataIn, u"This is the description string.",
+               nullptr, nullptr, nullptr, 0, &dataOut) == 0)
+180038c6b      log("CryptProtectData failed")
+180038c70      return 0xffffffff
+180038bc8  memcpy_s(arg3, *arg4, dataOut.pbData, dataOut.cbData)
+180038bdb  if (*arg4 < dataOut.cbData) ...  // buffer-too-small error
+180038c25  *arg4 = dataOut.cbData
+180038c2c  LocalFree(dataOut.pbData)
+180038c77  return 0
+
+KEY: DPAPI CryptProtectData wraps the plaintext PSK.
+     Unsealing requires the same Windows user/machine context.
+     On the same laptop → CryptUnprotectData works without any key.
+
+────────────────────────────────────────────────────────────────────────
+sub_1800952d0  ProcessPsk  (Geneva/GM168, source: geneva.c:ProcessPsk)
+────────────────────────────────────────────────────────────────────────
+1. Get MCU firmware version
+2. Check if PSK already valid in MCU (3 retries via sub_180038ea8)
+   → if valid: return success (PSK already provisioned)
+3. If not valid:
+   a. sub_180038ad0(&var_4b8, 0x20, &var_418, &var_5d0)
+      → CryptProtectData on 0x20 (32) bytes → DPAPI blob in var_418
+   b. sub_18003aba8(&var_5d0, &var_5c4)  → noop (zeros)
+   c. var_5d0 += 0x20   → adjust length
+   d. sub_18003a2e4(&var_518, 0x20, var_5d0, arg1)
+      → PresetPskWriteKey — generate fresh PSK, encrypt, write to MCU
+4. Verify again (3 write retries)
+5. Return success/failure
+
+────────────────────────────────────────────────────────────────────────
+sub_18003a2e4  PresetPskWriteKey  (source: pskunify.c)
+────────────────────────────────────────────────────────────────────────
+(Previously decompiled — key steps:)
+1. sub_18003836c(buf, 32)  → CryptGenRandom 32-byte PSK into buf
+2. sub_180001000(buf, 32, wb_blob, &wb_len)
+   → WhiteBox AES-128-CBC encrypt PSK → wb_blob (TLV 0xBB010003)
+3. sub_180038ad0(buf, 32, dpapi_blob, &dpapi_len)
+   → CryptProtectData PSK → dpapi_blob (TLV 0xBB010002)
+4. Build combined [dpapi_blob][wb_blob] packet
+5. Route to PresetPskWriteG or PresetPskWriteR based on MCU type
+
+────────────────────────────────────────────────────────────────────────
+sub_18003836c  GeneratePsk
+────────────────────────────────────────────────────────────────────────
+CryptAcquireContextW(out, "GoodixKeyContainer", nullptr,
+                     PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)
+CryptGenRandom(hProv, 32, psk_buf)
+→ plain 32 random bytes, no key involved
+
+────────────────────────────────────────────────────────────────────────
+sub_180001000  SecWhiteEncrypt / GoodixDataAesEncrypt
+────────────────────────────────────────────────────────────────────────
+Key derivation:
+  HMAC-SHA256 with IV = SHA-256 standard H0-H7 constants
+  Input: "123GOODIX" (hardcoded string)
+  → 32-byte WhiteBox key
+
+AES:
+  mbedtls_aes_setkey_enc(ctx, wb_key, 128)
+  mbedtls_aes_crypt_cbc(ctx, ENCRYPT, len, iv, input, output)
+  (IV = 16 zero bytes, or derived — needs hexdump of sub_180001000)
+
+Result: TLV blob tagged 0xBB010003
+
+────────────────────────────────────────────────────────────────────────
+sub_180097a6c  PresetPskWriteG  (source: geneva.c:PresetPskWriteG)
+────────────────────────────────────────────────────────────────────────
+Header magic (10 bytes prepended to PSK blob):
+  56 A5 BB 95 6B 7C 8D 9E 00 00
+
+Sends data in 0x100-byte chunks:
+  For each chunk i of N:
+    packet = [total_len:4B LE][chunk_len:4B LE][offset:4B LE][data...]
+    sub_1800783f0(..., 0xE0, packet, ...)   // first try
+    sub_1800783f0(..., 0xE4, packet, ...)   // second try / confirm
+
+────────────────────────────────────────────────────────────────────────
+sub_1800a9f14  PresetPskWriteR  (source: realtek.c:PresetPskWriteR)
+────────────────────────────────────────────────────────────────────────
+Same as PresetPskWriteG but no chunking, single transfer:
+  sub_1800783f0(..., 0xE0, arg1, arg2, ...)
+  sub_1800783f0(..., 0xE4, arg1, arg2, ...)
+
+────────────────────────────────────────────────────────────────────────
+sub_180097458  PresetPskReadG  (source: geneva.c:PresetPskReadG)
+────────────────────────────────────────────────────────────────────────
+Reads blob from MCU in 0x100-byte chunks:
+  For each chunk:
+    sub_1800783f0(..., 0xE4, request_packet, ...)
+    → response copied into arg3 (output buffer)
+Returns: raw MCU blob (DPAPI-sealed + WB-encrypted)
+
+────────────────────────────────────────────────────────────────────────
+sub_1800a45b8  PresetPskPskSet  (source: mcuimpl.c:PresetPskPskSet)
+────────────────────────────────────────────────────────────────────────
+*(arg1 + 0xe8) = arg3           // store psk_len in struct
+free(*(arg1 + 0xe0))
+*(arg1 + 0xe0) = malloc(arg3)
+memcpy(*(arg1 + 0xe0), arg2, arg3)  // cache plaintext PSK in memory
+
+────────────────────────────────────────────────────────────────────────
+sub_18003aba8  (noop)
+────────────────────────────────────────────────────────────────────────
+*arg1 = 0
+*arg2 = 0
+return 0
+
+────────────────────────────────────────────────────────────────────────
+sub_180006b10  wb_finalize (SHA-256 big-endian output)
+────────────────────────────────────────────────────────────────────────
+Standard SHA-256 finalization:
+- Pad message with bit length
+- Call sub_180005da0 (SHA-256 compression)
+- Output 8 x uint32 words in big-endian order → 32-byte digest
+
+────────────────────────────────────────────────────────────────────────
+sub_180006a30  wb_update (SHA-256 block feed)
+────────────────────────────────────────────────────────────────────────
+Standard SHA-256 update:
+- Append input to context buffer
+- Process complete 64-byte blocks via sub_180005da0 (compression)
+- Carry remainder for next call
+
+
+========================================================================
+PSK STORAGE FORMAT ON MCU
+========================================================================
+
+MCU stores two TLV blobs concatenated:
+
+  [TLV 0xBB010002] = DPAPI-sealed blob   (CryptProtectData output)
+  [TLV 0xBB010003] = WhiteBox AES blob   (AES-128-CBC with "123GOODIX" key)
+
+Both blobs contain the same 32-byte raw PSK, just differently protected.
+The DPAPI blob is the authoritative one on Windows (unsealed by CryptUnprotectData).
+The WB blob is the fallback / cross-check, decryptable offline.
+
+
+========================================================================
+EXTRACTION PATHS (no Windows / no SGX required)
+========================================================================
+
+PATH 1 — WhiteBox decrypt offline (pure Python, no Windows needed):
+  1. Read MCU blob via PresetPskReadG USB sequence (0xE4 command)
+  2. Find TLV 0xBB010003 blob
+  3. Derive WB key:
+       key = HMAC-SHA256(H0_init="SHA256_standard_IV", msg="123GOODIX")
+       (standard SHA-256 IV = 6a09e667 bb67ae85 3c6ef372 a54ff53a ...)
+  4. AES-128-CBC decrypt with that key → 32-byte PSK
+
+PATH 2 — DPAPI unseal on same laptop (Windows, same machine):
+  1. Read MCU blob → extract TLV 0xBB010002
+  2. CryptUnprotectData(blob) → 32-byte PSK
+  3. Works without any key if logged in as same user
+
+PATH 3 — Frida hook (easiest, no RE of format needed):
+  - Hook CryptUnprotectData return in WUDFHost.exe / Wbdi.dll
+  - Or hook PresetPskPskSet (sub_1800a45b8) arg2 at entry = plaintext PSK
+  - Or hook sub_18003836c (GeneratePsk) return = raw PSK before encryption
+
+PATH 4 — x64dbg breakpoint:
+  - BP at sub_1800a45b8+0x70 (after memcpy), read *(arg1+0xe0) = plaintext PSK
+
+RECOMMENDED: PATH 1 (offline WB decrypt) for Linux/libfprint integration.
+             PATH 3 (Frida) for quickest one-time extraction on Windows.
+
+
+========================================================================
+WHITEBOX KEY DERIVATION (Python reference)
+========================================================================
+
+import hmac, hashlib, struct
+
+# SHA-256 standard initial H0-H7 values (as 64 bytes big-endian)
+SHA256_H0 = bytes.fromhex(
+    "6a09e667bb67ae853c6ef372a54ff53a"  # H0 H1
+    "510e527f9b05688c1f83d9ab5be0cd19"  # H2 H3 H4 H5 H6 H7
+)
+
+# "123GOODIX" key derivation
+wb_key = hmac.new(SHA256_H0, b"123GOODIX", hashlib.sha256).digest()
+# → 32-byte WB key (first 16 bytes used as AES-128 key)
+aes_key = wb_key[:16]
+
+# Decrypt MCU blob (TLV 0xBB010003 payload)
+from Crypto.Cipher import AES
+iv = bytes(16)  # verify IV — may be first 16 bytes of blob
+cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+psk = cipher.decrypt(encrypted_payload)[:32]
+
+
+========================================================================
+END OF DUMP
+========================================================================
