@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Goodix GM168 — Geneva/Milan A0/B0 protocol implementation
 //
-// Верифицирован через:
+// Verified against:
 //   - Binary Ninja (Wbdi.dll pack_milan / sub_18009ff44)
 //   - fedora_3.log TX traces
 //   - Frida SendCmd hooks
@@ -130,12 +130,12 @@ goodix_gm168_encode_cmd (guint8 cmd, const guint8 *payload,
 
 // ─── Decode A0 ACK from MCU ──────────────────────────────────────────────────
 //
-// [FIX-B2] Верифицированный формат A0 ответа MCU:
+// Verified A0 MCU response layout:
 //   [A0][LenL][LenH][HdrSum]  [EchoCmd][PLenL][PLenH][Status][Extra...][BodySum]
 //    0    1     2     3           4       5      6       7       8...
 //
-// Ранее были неверные смещения: echo_cmd=data[7], status=data[8].
-// Правильно (совпадает с goodix_gm168_is_touch_event и Frida traces):
+// Earlier code used wrong offsets (echo_cmd=data[7], status=data[8]).
+// Correct (matches goodix_gm168_is_touch_event and Frida traces):
 //   echo_cmd = data[4]  (GOODIX_GM168_TOUCH_ECHO_OFF)
 //   status   = data[7]  (GOODIX_GM168_TOUCH_STATUS_OFF)
 gboolean
@@ -148,7 +148,7 @@ goodix_gm168_decode_ack (const guint8 *data, guint32 data_len,
     if (data[0] != GOODIX_GM168_PKT_CMD)
         return FALSE;
 
-    /* [FIX-B2] Правильные offset'ы: echo=data[4], status=data[7] */
+    /* Verified offsets: echo=data[4], status=data[7] */
     *echo_cmd = data[GOODIX_GM168_TOUCH_ECHO_OFF];    /* data[4] */
     *status   = data[GOODIX_GM168_TOUCH_STATUS_OFF];  /* data[7] */
 
@@ -242,7 +242,7 @@ goodix_gm168_decode_img (const guint8 *data, guint32 data_len,
         return NULL;
     }
 
-    /* Динамический поиск TLS заголовка (0x17 0x03 0x03) в пределах первых 32 байт */
+    /* Scan the first 32 bytes for the TLS record header (0x17 0x03 0x03). */
     guint32 search_limit = (inner_len > 32) ? 32 : inner_len;
     guint32 tls_offset = 0;
     

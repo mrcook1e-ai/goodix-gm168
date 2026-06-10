@@ -69,7 +69,7 @@ err_from_ssl (void)
 
 // ─── PSK callback ─────────────────────────────────────────────────────────────
 //
-// MCU (клиент) присылает identity="Client_identity" и ждёт наш PSK.
+// The MCU (client) sends identity="Client_identity" and expects our PSK.
 static unsigned int
 psk_server_cb (SSL *ssl, const char *identity, unsigned char *psk,
                unsigned int max_psk_len)
@@ -81,11 +81,12 @@ psk_server_cb (SSL *ssl, const char *identity, unsigned char *psk,
              identity ? identity : "(null)", max_psk_len);
 
     /*
-     * Используем REAL_PSK (goodix_gm168_psk) — 32-байтовый ключ,
-     * захваченный через Frida из Windows-драйвера (Wbdi.dll).
-     * MCU уже знает этот ключ — он был записан туда Windows-драйвером.
-     * PSK запись/сброс требует TLS (или IAP-режим), поэтому мы не
-     * можем сменить его до установки TLS-сессии.
+     * goodix_gm168_psk holds the 32-byte device-specific PSK that the
+     * MCU was provisioned with at the factory (or by the Windows driver
+     * during install).  We loaded it at dev_activate from
+     * <dir>/psk.bin (see gm168_load_psk_from_file).  Rewriting the PSK
+     * requires an active TLS session or the IAP service mode, so for
+     * normal operation we just use what's already on the device.
      */
     unsigned int psk_len = (unsigned int)sizeof (goodix_gm168_psk);
 
@@ -96,7 +97,7 @@ psk_server_cb (SSL *ssl, const char *identity, unsigned char *psk,
     }
 
     memcpy (psk, goodix_gm168_psk, psk_len);
-    g_debug ("goodix-gm168: PSK callback returning %u bytes of REAL_PSK", psk_len);
+    g_debug ("goodix-gm168: PSK callback returning %u bytes", psk_len);
     return psk_len;
 }
 
@@ -109,7 +110,7 @@ create_ctx (void)
     if (!ctx)
         return NULL;
 
-    // TLS 1.2 only — именно эту версию использует GM168 (из Binary Ninja)
+    // TLS 1.2 only — the version GM168 uses (verified in Binary Ninja).
     SSL_CTX_set_min_proto_version (ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version (ctx, TLS1_2_VERSION);
 
@@ -167,12 +168,12 @@ create_ctx (void)
 
 // ─── TLS server thread ────────────────────────────────────────────────────────
 //
-// [FIX-2] Поток блокируется внутри SSL_accept.
-// Данные поступают через socketpair:
+// The thread blocks inside SSL_accept.  Data flows over the socketpair:
 //   driver → write(client_fd) → kernel → SSL thread reads from sock_fd
 //   SSL thread writes to sock_fd → kernel → driver reads from client_fd
-// Это полностью thread-safe: write/read на РАЗНЫХ fd socketpair.
-// Mutex нужен только для защиты нескольких операций feed+pull как атомарного блока.
+// This is fully thread-safe: write/read happen on DIFFERENT ends of the
+// socketpair.  A mutex would only be needed if we had to make several
+// feed+pull operations atomic — we don't.
 
 static void *
 tls_serve_thread (void *arg)
@@ -289,9 +290,10 @@ goodix_gm168_tls_init (GoodixGM168TlsServer *self, GError **error)
     return TRUE;
 }
 
-// Передать сырые TLS-байты от MCU (из B0/B2 пакета) в OpenSSL
-// Thread-safe: write на client_fd, SSL thread читает из sock_fd (другой конец).
-// Mutex не нужен для write vs read на разных fd — POSIX гарантирует atomicity.
+// Hand raw TLS bytes from the MCU (out of a B0/B2 packet) to OpenSSL.
+// Thread-safe: we write to client_fd, the SSL thread reads from sock_fd
+// (the other end of the socketpair).  No mutex needed for write vs read
+// on different fds — POSIX guarantees atomicity.
 int
 goodix_gm168_tls_feed (GoodixGM168TlsServer *self, const guint8 *data,
                         guint32 length)
@@ -347,16 +349,16 @@ goodix_gm168_tls_pull (GoodixGM168TlsServer *self, guint8 *buf, guint16 size)
     return (int)n;
 }
 
-// Прочитать расшифрованные данные от MCU (после успешного handshake)
-// Вызывается ТОЛЬКО после goodix_gm168_tls_feed.
+// Read decrypted data from the MCU (after a successful handshake).
+// Must only be called after goodix_gm168_tls_feed().
 int
 goodix_gm168_tls_recv (GoodixGM168TlsServer *self, guint8 *buf, guint32 size,
                         GError **error)
 {
     /*
-     * [FIX-B1] SSL_read может вернуть SSL_ERROR_WANT_READ сразу после
-     * goodix_gm168_tls_feed(), потому что данные ещё не успели пройти
-     * через socketpair в OpenSSL-слой.
+     * SSL_read can return SSL_ERROR_WANT_READ immediately after a
+     * goodix_gm168_tls_feed() if the bytes haven't yet propagated
+     * through the socketpair into OpenSSL's read buffer.
      *
      * [G9-C] Shrunk from 50x5ms (250ms blocking the main thread) to
      * 5x1ms (5ms cap). On WANT_READ after the cap, return 0 — the caller
@@ -409,7 +411,7 @@ goodix_gm168_tls_cancel (GoodixGM168TlsServer *self)
     }
 }
 
-// Отправить данные MCU (зашифрует и запишет в sock_fd)
+// Send data to the MCU (OpenSSL encrypts and writes to sock_fd).
 int
 goodix_gm168_tls_send (GoodixGM168TlsServer *self, const guint8 *data,
                         guint16 length)

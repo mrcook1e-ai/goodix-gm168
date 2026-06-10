@@ -37,7 +37,7 @@
 //
 // HdrSum  = (0xA0 + LenL + LenH) & 0xFF
 // BodySum = (0xAA - (Cmd + PLenL + PLenH + SUM(payload))) & 0xFF
-// PLenL/H = len(payload) + 1  (включает байт BodySum)
+// PLenL/H = len(payload) + 1  (includes the BodySum byte)
 #define GOODIX_GM168_PKT_CMD  0xA0
 #define GOODIX_GM168_PKT_TLS  0xB0
 #define GOODIX_GM168_PKT_IMG  0xB2
@@ -78,7 +78,7 @@
 #define GOODIX_GM168_STATUS_BAD_CMD   0xFF
 
 // ─── Touch event detection ────────────────────────────────────────────────────
-// MCU шлёт A0 (24B) когда палец обнаружен:
+// MCU sends an A0 packet (24 B) when a finger is detected:
 // a0 14 00 b4 32 11 00 02 00 3f 00 b9 00 c0 00 91 00 9d 00 86 00 b7 00 42
 // data[4]=0x32 (echo_cmd), data[7]=0x02 (TOUCH status)
 #define GOODIX_GM168_TOUCH_PKT_LEN    24
@@ -89,7 +89,7 @@
 // Populated by gm168_load_psk_from_file() at dev_activate. Zero-initialised at
 // startup; TLS handshake will fail until the file is loaded.
 extern guint8 goodix_gm168_psk[32];
-// PSK identity string (верифицирован из Binary Ninja: 32 вхождения)
+// PSK identity string (verified via Binary Ninja: 32 occurrences in Wbdi.dll)
 extern const char goodix_gm168_psk_identity[];
 
 // ─── TLS ──────────────────────────────────────────────────────────────────────
@@ -147,12 +147,12 @@ typedef struct __attribute__((__packed__)) {
 
 // ─── Function declarations ────────────────────────────────────────────────────
 
-// Encode: создать корректный A0-пакет
+// Encode: build a valid A0 packet
 // Returns allocated buffer (caller must g_free), sets out_len
 guint8 *goodix_gm168_encode_cmd(guint8 cmd, const guint8 *payload,
                                  guint16 payload_len, guint32 *out_len);
 
-// Decode: разобрать A0-ответ от MCU
+// Decode: parse an A0 reply from the MCU
 gboolean goodix_gm168_decode_ack(const guint8 *data, guint32 data_len,
                                    guint8 *echo_cmd, guint8 *status,
                                    guint8 **extra, guint16 *extra_len);

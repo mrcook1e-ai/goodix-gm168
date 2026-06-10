@@ -34,7 +34,7 @@ typedef struct {
     gint64  last_ev_us;     /* time of previous gm168_log_ev call; 0=none   */
     int     touch_count;    /* incremented by gm168_log_touch_divider       */
     int     stage_count;    /* incremented in rearm_completed on submit     */
-    char    path[1024];  /* dir (up to ~990) + "/gm168-YYYYMMDD-HHMMSS.log" */
+    char   *path;           /* dir + "/gm168-YYYYMMDD-HHMMSS.log"; g_free'd */
 
     /* Timing anchors set by caller for elapsed-in-phase calculation.      */
     gint64  init_start_us;

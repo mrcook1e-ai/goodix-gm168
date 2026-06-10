@@ -49,13 +49,10 @@ gm168_log_open (Gm168Log *log)
 
     /* Resolve session directory: $GM168_LOG_DIR or ~/.goodix-gm168/sessions */
     const char *env_dir = g_getenv ("GM168_LOG_DIR");
-    char dir[996];  /* leave 28 chars for "/gm168-YYYYMMDD-HHMMSS.log\0" */
-    if (env_dir && *env_dir) {
-        g_strlcpy (dir, env_dir, sizeof (dir));
-    } else {
-        snprintf (dir, sizeof (dir), "%s/.goodix-gm168/sessions",
-                  g_get_home_dir ());
-    }
+    g_autofree char *dir =
+        (env_dir && *env_dir)
+            ? g_strdup (env_dir)
+            : g_strdup_printf ("%s/.goodix-gm168/sessions", g_get_home_dir ());
 
     if (g_mkdir_with_parents (dir, 0755) != 0) {
         g_warning ("gm168_log: cannot create log dir %s: %s",
@@ -66,17 +63,17 @@ gm168_log_open (Gm168Log *log)
     /* Filename: gm168-YYYYMMDD-HHMMSS.log */
     time_t now_t  = time (NULL);
     struct tm *tm = localtime (&now_t);
-    snprintf (log->path, sizeof (log->path),
-              "%s/gm168-%04d%02d%02d-%02d%02d%02d.log",
-              dir,
-              tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
-              tm->tm_hour,        tm->tm_min,      tm->tm_sec);
+    log->path = g_strdup_printf (
+        "%s/gm168-%04d%02d%02d-%02d%02d%02d.log",
+        dir,
+        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+        tm->tm_hour,        tm->tm_min,      tm->tm_sec);
 
     log->fp = fopen (log->path, "w");
     if (!log->fp) {
         g_warning ("gm168_log: cannot open %s: %s",
                    log->path, g_strerror (errno));
-        log->path[0] = '\0';
+        g_clear_pointer (&log->path, g_free);
         return;
     }
 
@@ -109,7 +106,8 @@ gm168_log_close (Gm168Log *log)
              total, log->path);
 
     fclose (log->fp);
-    log->fp   = NULL;
+    log->fp = NULL;
+    g_clear_pointer (&log->path, g_free);
 }
 
 void

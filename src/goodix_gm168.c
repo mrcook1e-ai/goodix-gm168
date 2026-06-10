@@ -357,85 +357,6 @@ on_tls_done (GoodixGM168TlsServer *tls, GError *error, gpointer ud)
  * trailing 4-byte CRC — note that the first byte is *not* a header, the
  * data starts at offset 0).
  */
-/* Contrast-Limited Adaptive Histogram Equalization.
- *
- * Build a 256-bin clipped histogram per 16x16 tile, derive a tile-local
- * CDF→LUT, then for each output pixel bilinearly interpolate the four
- * surrounding tile LUTs. Matches the standard Zuiderveld / skimage
- * algorithm; verified in Python against captured INPUT/FRAME pairs to
- * give ~1.3x correlation lift over the previous percentile stretch.
- *
- * `in` is already normalised to 0..255 (the caller percentile-clips so
- * cold/hot pixels don't blow the per-tile dynamic range). */
-static void
-gm168_clahe (const guint8 *in, guint8 *out)
-{
-    const int W = GM168_FRAME_W;
-    const int H = GM168_FRAME_H;
-    const int tw = GM168_CLAHE_TILE_W;
-    const int th = GM168_CLAHE_TILE_H;
-    const int tx_n = GM168_CLAHE_TX;
-    const int ty_n = GM168_CLAHE_TY;
-    const int tile_px = tw * th;
-
-    guint8 lut[GM168_CLAHE_TY][GM168_CLAHE_TX][256];
-
-    for (int ty = 0; ty < ty_n; ty++) {
-        for (int tx = 0; tx < tx_n; tx++) {
-            int hist[256] = {0};
-            for (int dy = 0; dy < th; dy++) {
-                int y = ty * th + dy;
-                for (int dx = 0; dx < tw; dx++)
-                    hist[in[y * W + tx * tw + dx]]++;
-            }
-            int excess = 0;
-            for (int b = 0; b < 256; b++) {
-                if (hist[b] > GM168_CLAHE_CLIP) {
-                    excess += hist[b] - GM168_CLAHE_CLIP;
-                    hist[b] = GM168_CLAHE_CLIP;
-                }
-            }
-            int bonus = excess / 256;
-            int remainder = excess - bonus * 256;
-            for (int b = 0; b < 256; b++) hist[b] += bonus;
-            for (int b = 0; b < remainder; b++) hist[b]++;
-            int cum = 0;
-            for (int b = 0; b < 256; b++) {
-                cum += hist[b];
-                lut[ty][tx][b] = (guint8)((cum * 255 + tile_px / 2) / tile_px);
-            }
-        }
-    }
-
-    /* Bilinear interpolation between the 4 nearest tile centers (which sit
-     * at (tx*tw + tw/2, ty*th + th/2)). Edge pixels clamp to the border
-     * tile on the missing side. */
-    for (int y = 0; y < H; y++) {
-        float ty_f = ((float)y - th * 0.5f + 0.5f) / th;
-        int ty0 = (int)floorf (ty_f);
-        float fy = ty_f - ty0;
-        if (ty0 < 0)        { ty0 = 0;          fy = 0.0f; }
-        if (ty0 >= ty_n-1)  { ty0 = ty_n - 1;   fy = 0.0f; }
-        int ty1 = (ty0 + 1 < ty_n) ? ty0 + 1 : ty0;
-        for (int x = 0; x < W; x++) {
-            float tx_f = ((float)x - tw * 0.5f + 0.5f) / tw;
-            int tx0 = (int)floorf (tx_f);
-            float fx = tx_f - tx0;
-            if (tx0 < 0)        { tx0 = 0;         fx = 0.0f; }
-            if (tx0 >= tx_n-1)  { tx0 = tx_n - 1;  fx = 0.0f; }
-            int tx1 = (tx0 + 1 < tx_n) ? tx0 + 1 : tx0;
-            guint8 v = in[y * W + x];
-            float v00 = lut[ty0][tx0][v];
-            float v01 = lut[ty0][tx1][v];
-            float v10 = lut[ty1][tx0][v];
-            float v11 = lut[ty1][tx1][v];
-            float v0  = v00 * (1.0f - fx) + v01 * fx;
-            float v1  = v10 * (1.0f - fx) + v11 * fx;
-            float vo  = v0  * (1.0f - fy) + v1  * fy;
-            out[y * W + x] = (guint8)(vo + 0.5f);
-        }
-    }
-}
 
 /* Envelope-based local contrast stretch.
  *
@@ -2060,14 +1981,6 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
-/* qsort comparator for float arrays (used in CLAHE percentile-clip path). */
-static int
-cmp_float_asc (const void *a, const void *b)
-{
-    float fa = *(const float *)a;
-    float fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
 
 static void
 capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
@@ -2150,100 +2063,14 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
         fp_img->flags = FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
         fp_img->ppmm = 19.685f; /* 500 DPI — required by NBIS MINDTCT */
 
-        /* Default path: envelope-based local contrast stretch (matches the
-         * Windows preprocessor byte-for-byte on test captures, modulo the
-         * smoother). Set $GM168_USE_CLAHE=1 to fall back to the older
-         * CLAHE-based pipeline for A/B comparison. */
-        float *tmp_buf = NULL;
-        if (!g_getenv ("GM168_USE_CLAHE")) {
-            gm168_envelope_stretch (raw16, self->background, fp_img->data);
-            goto post_process_done;
-        }
+        /* Envelope-based local contrast stretch — matches the Windows
+         * preprocessor byte-for-byte on test captures (modulo the
+         * smoother).  The earlier CLAHE+Gaussian pipeline lived behind
+         * GM168_USE_CLAHE/GM168_NO_CLAHE flags for A/B comparison; the
+         * envelope path consistently won, so the CLAHE branch was
+         * dropped in Stage B cleanup. */
+        gm168_envelope_stretch (raw16, self->background, fp_img->data);
 
-        tmp_buf = g_new (float, GM168_FRAME_PIXELS);
-
-        if (self->background) {
-            for (int i = 0; i < GM168_FRAME_PIXELS; i++)
-                tmp_buf[i] = (float)((gint32)raw16[i] - (gint32)self->background[i]);
-        } else {
-            /* Fallback: per-column median subtraction. Without a real
-             * calibration reference this is noisy; preferable path is to
-             * have INIT_BG_PROCESS populate self->background first.    */
-            guint16 col_vals[GM168_FRAME_H];
-            float   col_med[GM168_FRAME_W];
-            for (int c = 0; c < GM168_FRAME_W; c++) {
-                for (int r = 0; r < GM168_FRAME_H; r++)
-                    col_vals[r] = raw16[r * GM168_FRAME_W + c];
-                for (int a = 0; a <= GM168_FRAME_H / 2; a++) {
-                    int mi = a;
-                    for (int b = a + 1; b < GM168_FRAME_H; b++)
-                        if (col_vals[b] < col_vals[mi]) mi = b;
-                    guint16 tmp = col_vals[a];
-                    col_vals[a] = col_vals[mi];
-                    col_vals[mi] = tmp;
-                }
-                col_med[c] = (float)col_vals[GM168_FRAME_H / 2];
-            }
-            for (int r = 0; r < GM168_FRAME_H; r++)
-                for (int c = 0; c < GM168_FRAME_W; c++)
-                    tmp_buf[r * GM168_FRAME_W + c] =
-                        (float)raw16[r * GM168_FRAME_W + c] - col_med[c];
-        }
-
-        /* Two-stage normalisation:
-         *   1. Percentile-clip (2..98) to a global 0..255 byte image — robust
-         *      to hot/dead pixels that otherwise eat the dynamic range.
-         *   2. CLAHE for local contrast that survives ridge-frequency
-         *      illumination drift. Replaces the old global linear stretch,
-         *      which left the per-tile std too low for NBIS minutiae work. */
-        float *sorted = g_new (float, GM168_FRAME_PIXELS);
-        memcpy (sorted, tmp_buf, sizeof (float) * GM168_FRAME_PIXELS);
-        /* qsort (O(n log n)) replaces the old O(n²) selection sort that
-         * took ~13M comparisons per frame in the CLAHE percentile-clip path. */
-        qsort (sorted, GM168_FRAME_PIXELS, sizeof (float), cmp_float_asc);
-        int lo_idx = (int)(GM168_FRAME_PIXELS * 0.02f);
-        int hi_idx = (int)(GM168_FRAME_PIXELS * 0.98f);
-        float vlo = sorted[lo_idx];
-        float vhi = sorted[hi_idx];
-        g_free (sorted);
-        float vrange = vhi - vlo;
-        if (vrange < 1.0f) vrange = 1.0f;
-        fp_dbg ("capture: clip p2=%.1f p98=%.1f", vlo, vhi);
-
-        guint8 norm[GM168_FRAME_PIXELS];
-        for (int i = 0; i < GM168_FRAME_PIXELS; i++)
-            norm[i] = (guint8)CLAMP ((tmp_buf[i] - vlo) * 255.0f / vrange,
-                                     0, 255);
-
-        /* CLAHE then 3x3 Gaussian smooth. CLAHE alone reached enroll
-         * stage 4/5 in testing; the post-blur tames single-pixel high-
-         * frequency artifacts that mindtct's ridge tracker treats as
-         * noise. Set $GM168_NO_CLAHE=1 to fall back to plain stretch. */
-        if (g_getenv ("GM168_NO_CLAHE")) {
-            memcpy (fp_img->data, norm, GM168_FRAME_PIXELS);
-        } else {
-            guint8 clahe_out[GM168_FRAME_PIXELS];
-            gm168_clahe (norm, clahe_out);
-            /* 3x3 Gaussian: kernel 1 2 1 / 2 4 2 / 1 2 1, normaliser 16.
-             * Border pixels keep their pre-blur value. */
-            memcpy (fp_img->data, clahe_out, GM168_FRAME_PIXELS);
-            for (int y = 1; y < GM168_FRAME_H - 1; y++) {
-                for (int x = 1; x < GM168_FRAME_W - 1; x++) {
-                    int s = clahe_out[(y-1)*GM168_FRAME_W + (x-1)]
-                          + 2 * clahe_out[(y-1)*GM168_FRAME_W + x]
-                          + clahe_out[(y-1)*GM168_FRAME_W + (x+1)]
-                          + 2 * clahe_out[y*GM168_FRAME_W + (x-1)]
-                          + 4 * clahe_out[y*GM168_FRAME_W + x]
-                          + 2 * clahe_out[y*GM168_FRAME_W + (x+1)]
-                          + clahe_out[(y+1)*GM168_FRAME_W + (x-1)]
-                          + 2 * clahe_out[(y+1)*GM168_FRAME_W + x]
-                          + clahe_out[(y+1)*GM168_FRAME_W + (x+1)];
-                    fp_img->data[y*GM168_FRAME_W + x] = (guint8)((s + 8) / 16);
-                }
-            }
-        }
-
-post_process_done:
 #ifdef GM168_DEBUG
         {
             static int dbg_seq = 0;
