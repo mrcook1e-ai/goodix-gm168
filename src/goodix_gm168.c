@@ -2094,7 +2094,6 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
             fp_warn ("DEBUG: dumped seq=%d to /tmp/gm168_%03d_*", dbg_seq, dbg_seq);
         }
 #endif
-        if (tmp_buf) g_free (tmp_buf);
         g_free (raw16);
 
         /* ── Quality-gate (Windows-style retry-until-good) ──────────────
