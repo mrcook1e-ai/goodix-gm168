@@ -2,7 +2,7 @@ diff --git a/libfprint/meson.build b/libfprint/meson.build
 index 0ca1767..11dc4e4 100644
 --- a/libfprint/meson.build
 +++ b/libfprint/meson.build
-@@ -147,6 +147,10 @@ driver_sources = {
+@@ -147,6 +147,11 @@ driver_sources = {
          [ 'drivers/synaptics/synaptics.c', 'drivers/synaptics/bmkt_message.c' ],
      'goodixmoc' :
          [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
