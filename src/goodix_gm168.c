@@ -2965,10 +2965,16 @@ static void dev_deactivate (FpImageDevice *dev)
     self->deactivating = TRUE;
 
     /* Free any quality-gate state that survived the session — prevents
-     * us from submitting a stale image on the next activate. */
+     * us from submitting a stale image on the next activate.  Mirrors
+     * the reset in dev_activate so a dual-capture that's caught mid-
+     * flight doesn't hold a ~10 KiB FpImage hostage until the next
+     * activation. */
     g_clear_object (&self->best_img);
-    self->best_quality    = 0.0f;
-    self->capture_attempt = 0;
+    g_clear_object (&self->dual_pending_img);
+    self->best_quality         = 0.0f;
+    self->dual_pending_quality = 0.0f;
+    self->dual_in_second       = FALSE;
+    self->capture_attempt      = 0;
 
     if (self->io_cancellable) {
         g_cancellable_cancel(self->io_cancellable);
