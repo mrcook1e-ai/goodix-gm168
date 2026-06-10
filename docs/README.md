@@ -1,25 +1,17 @@
-# Goodix GM168 — Documentation index
+# goodix-gm168 — Documentation
 
-Project documentation. Read in this order:
+Project documentation, in reading order:
 
 | File | What's in it |
 |------|---|
-| [SUMMARY.md](SUMMARY.md) | High-level overview of what shipped this session, before/after table of changes, completed-tasks list |
-| [DRIVER.md](DRIVER.md) | Linux driver internals: decoder, state machines, runtime safety, build/test instructions — the file to read before touching `goodix_gm168.c` |
-| [PSK.md](PSK.md) | PSK lifecycle (provisioning + runtime), the DPAPI/MCU sealing scheme, evidence from Frida capture, and the cross-host sharing strategy |
-| [PIPELINE.md](PIPELINE.md) | End-to-end extraction pipeline: Frida capture → DPAPI unseal → Linux driver. Concrete commands, failure modes, portability table. |
-| [DEV_STACK.md](DEV_STACK.md) | How dev is wired: PC + laptop, SSH ports 22 (Windows) and 2200 (WSL), repo layout, deploy/fetch scripts |
-| [NEXT_STEPS.md](NEXT_STEPS.md) | Roadmap with priorities and effort estimates — what to do in the next session, where to start |
+| [DRIVER.md](DRIVER.md) | Driver internals: decoder, state machines, build/test |
+| [PIPELINE.md](PIPELINE.md) | End-to-end image pipeline: USB → TLS → decode → NBIS |
+| [PSK.md](PSK.md) | PSK lifecycle, DPAPI/MCU sealing scheme, sharing strategy |
 
-For protocol and reverse-engineering details, the canonical reference lives
-in `../RESEARCH.md` at the repo root. Its TL;DR section has the verified
-decode algorithm in C; the rest documents the wire format, commands,
-calibration blob layout, and Frida instrumentation.
+For install / usage docs see the repo-root [README.md](../README.md) and
+[INSTALL.md](../INSTALL.md).
 
-## Quick navigation
-
-- Driver source: [`../goodix_gm168/goodix_gm168.c`](../goodix_gm168/goodix_gm168.c)
-- Frida hook: [`../frida_work/gx_hook.js`](../frida_work/gx_hook.js)
-- Analysis scripts: [`../scripts/`](../scripts/)
-- Captured ground truth: `../frida_work/dumps/`
-- Calibration blob: [`../calib_windows.dat`](../calib_windows.dat)
+For the reverse-engineering history — pcaps, Wbdi.dll extraction
+scripts, WhiteBox AES key derivation, RE methodology — see the
+[`archive/reverse-engineering`](https://github.com/mrcook1e-ai/goodix-gm168/tree/archive/reverse-engineering)
+branch.
