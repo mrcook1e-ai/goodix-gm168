@@ -120,11 +120,24 @@ log "installing to $PREFIX (sudo)"
 sudo meson install -C "$BUILD_DIR" >/dev/null
 
 # --- Make fprintd find our libfprint ---------------------------------
-log "wiring fprintd to $PREFIX/lib64 via ld.so.conf.d"
+# Two-pronged: ld.so.conf so any libfprint client picks ours up, AND a
+# systemd drop-in so fprintd's LD_LIBRARY_PATH explicitly points there
+# (defends against the system libfprint winning the resolve order).
+log "wiring fprintd to $PREFIX/lib64"
 sudo tee /etc/ld.so.conf.d/goodix-gm168.conf >/dev/null <<EOF
 $PREFIX/lib64
 EOF
 sudo ldconfig
+
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/goodix-gm168.conf >/dev/null <<EOF
+# Installed by install.sh — points fprintd at the goodix-gm168 build.
+# Remove this file and \`systemctl daemon-reload\` to fall back to the
+# distro libfprint.
+[Service]
+Environment=LD_LIBRARY_PATH=$PREFIX/lib64
+EOF
+sudo systemctl daemon-reload
 
 # --- udev + state dir ------------------------------------------------
 log "installing udev rule (uaccess for 27c6:589a)"
