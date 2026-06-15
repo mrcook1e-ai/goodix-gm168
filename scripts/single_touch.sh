@@ -25,22 +25,33 @@ mkdir -p "$LOG_DIR"
 
 TS="$(date +%Y%m%d-%H%M%S)"
 DUMP_DIR="$(mktemp -d -t gm168-single-XXXXXX)"
-OUT_PNG="$LOG_DIR/single-touch-$TS.png"
 
 KEEP_DUMPS=0
 PREFIX="${PREFIX:-/opt/libfprint-goodix-gm168}"
 CAPTURE_BIN="${CAPTURE_BIN:-}"
+LABEL=""
+OUT_DIR_OVERRIDE=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --keep)  KEEP_DUMPS=1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep)   KEEP_DUMPS=1; shift ;;
+        --label)  LABEL="$2"; shift 2 ;;
+        --out-dir) OUT_DIR_OVERRIDE="$2"; shift 2 ;;
         --help|-h)
             sed -n '2,/^set -euo/p' "$0" | sed -E 's/^# ?//; /^set -euo/d'
             exit 0
             ;;
-        *) echo "unknown arg: $arg" >&2; exit 2 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+[[ -n "$OUT_DIR_OVERRIDE" ]] && LOG_DIR="$OUT_DIR_OVERRIDE" && mkdir -p "$LOG_DIR"
+
+if [[ -n "$LABEL" ]]; then
+    OUT_PNG="$LOG_DIR/single-touch-$TS-$LABEL.png"
+else
+    OUT_PNG="$LOG_DIR/single-touch-$TS.png"
+fi
 
 cleanup () {
     if [[ "$KEEP_DUMPS" -eq 0 ]]; then
