@@ -136,6 +136,11 @@ sudo tee /etc/systemd/system/fprintd.service.d/goodix-gm168.conf >/dev/null <<EO
 # distro libfprint.
 [Service]
 Environment=LD_LIBRARY_PATH=$PREFIX/lib64
+# fprintd.service runs with ProtectSystem=strict, which makes /etc
+# read-only.  The driver writes sealed.bin / psk.bin under
+# /etc/goodix-gm168/ during PSK bootstrap, so it needs an explicit
+# rw exception.
+ReadWritePaths=/etc/goodix-gm168
 EOF
 sudo systemctl daemon-reload
 

@@ -161,6 +161,33 @@ re-plug the device or reboot.
 **Driver appears to hang** — open an issue with the structured log at
 `~/.goodix-gm168/sessions/gm168-*.log` from the failing session.
 
+**TLS handshake fails with `bad record mac` or `client Finished verify failed`** —
+the sensor keeps its TLS context across USB resets, so if a previous run died
+mid-handshake the MCU can be stuck on a stale session and your new
+ClientHello/Finished won't verify.
+
+First confirm the PSK is still the right one — the driver ships a probe that
+asks the sensor for `SHA256(PSK)` and compares against your `psk.bin`:
+
+```bash
+sudo systemctl stop fprintd
+sudo python3 scripts/check_psk.py /etc/goodix-gm168/psk.bin
+# ✓ MATCH → it's a stale-state problem, not a PSK rotation
+# ✗ MISMATCH → Windows re-provisioned the sensor, redo the PSK bootstrap
+```
+
+If the PSK matches, force a clean handshake from a standalone run before
+restarting fprintd — the in-tree `examples/img-capture` walks the same INIT
+SSM and rewrites the sensor's TLS context:
+
+```bash
+GOODIX_GM168_DIR=~/.goodix-gm168 \
+    LD_LIBRARY_PATH=/opt/libfprint-goodix-gm168/lib64 \
+    /opt/libfprint-goodix-gm168/libexec/libfprint-2/examples/img-capture
+# look for "TLS handshake COMPLETE ✓" — then:
+sudo systemctl start fprintd
+```
+
 ## Acknowledgements
 
 - libfprint authors and the existing Goodix drivers (`goodixmoc`,
