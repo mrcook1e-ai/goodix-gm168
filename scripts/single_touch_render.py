@@ -165,7 +165,11 @@ def make_tile(pixels8: List[int], label: str, st: dict, sat: float, scale: int):
     line3 = f"std:{st['std']:6.2f}                sat:{sat * 100:4.1f}%"
     draw.text((8, 28), line2, fill=(220, 220, 220), font=font_sm)
     draw.text((8, 44), line3, fill=(220, 220, 220), font=font_sm)
-    draw.text((8, 60), "min/max stretched for display", fill=(160, 160, 160), font=font_sm)
+    if "p50" in st:
+        line4 = f"p10:{st['p10']:4d}  p50:{st['p50']:4d}  p90:{st['p90']:4d}"
+        draw.text((8, 60), line4, fill=(180, 220, 180), font=font_sm)
+    else:
+        draw.text((8, 60), "min/max stretched for display", fill=(160, 160, 160), font=font_sm)
     return tile
 
 
@@ -204,6 +208,16 @@ def main() -> None:
     bg16: Optional[List[int]] = read_raw16(bg_path) if bg_path.exists() else None
     final8 = read_pgm8(pgm_path)
 
+    # envgap is dumped by gm168_envelope_stretch — index runs separately,
+    # so just pick the latest available one (same touch).
+    envgap_path = in_dir / f"gm168_{seq:03d}_envgap.bin"
+    if not envgap_path.exists():
+        # fall back to the highest-numbered envgap in the dir (single-touch
+        # dump dir usually has only one)
+        candidates = sorted(in_dir.glob("gm168_*_envgap.bin"))
+        envgap_path = candidates[-1] if candidates else None
+    envgap: Optional[List[int]] = read_raw16(envgap_path) if envgap_path and envgap_path.exists() else None
+
     tiles = []
 
     raw_st = stats(raw16)
@@ -222,6 +236,18 @@ def main() -> None:
 
     final_st = stats(final8)
     tiles.append(("FINAL (envelope→8b)", final_st, saturation_8bit(final8), final8))
+
+    if envgap is not None:
+        gap_st = stats(envgap)
+        gap_sorted = sorted(envgap)
+        gap_p10 = gap_sorted[len(gap_sorted) // 10]
+        gap_p50 = gap_sorted[len(gap_sorted) // 2]
+        gap_p90 = gap_sorted[len(gap_sorted) * 9 // 10]
+        gap_st["p10"] = gap_p10
+        gap_st["p50"] = gap_p50
+        gap_st["p90"] = gap_p90
+        gap8 = normalize_12bit_to_8bit(envgap)
+        tiles.append(("ENV-GAP (high-low)", gap_st, saturation_8bit(gap8), gap8))
 
     rendered = [make_tile(px, lbl, st, sat, args.scale) for lbl, st, sat, px in tiles]
     tile_w = rendered[0].width

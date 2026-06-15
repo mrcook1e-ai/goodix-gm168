@@ -753,6 +753,40 @@ gm168_envelope_stretch (const guint16 *raw, const guint16 *bg, guint8 *out)
     gm168_envelope_v  (smoothed, low_v, high_v);
     gm168_envelope_combine (low_h, high_h, low_v, high_v);
     gm168_morph_close_x5 (low_v, high_v, low_h, high_h);
+
+    /* Diagnostic: dump the per-pixel envelope gap (high - low) so the
+     * single_touch renderer can show where local_stretch would amplify
+     * noise (small gap = candidate for GM168_WEAK_GAP masking).  Same
+     * gate as the frame dumps in capture_completed. */
+    {
+        const gchar *dump_dir = NULL;
+#ifdef GM168_DEBUG
+        dump_dir = g_getenv ("GM168_DUMP_DIR");
+        if (!dump_dir) dump_dir = "/tmp";
+#else
+        if (g_getenv ("GM168_DUMP_FRAMES")) {
+            dump_dir = g_getenv ("GM168_DUMP_DIR");
+            if (!dump_dir) dump_dir = "/tmp";
+        }
+#endif
+        if (dump_dir) {
+            static int env_seq = 0;
+            env_seq++;
+            guint16 *gap = g_new (guint16, N);
+            for (int i = 0; i < N; i++) {
+                gint32 d = (gint32) high_h[i] - (gint32) low_h[i];
+                if (d < 0) d = 0;
+                if (d > 0xFFFF) d = 0xFFFF;
+                gap[i] = (guint16) d;
+            }
+            g_autofree gchar *p = g_strdup_printf ("%s/gm168_%03d_envgap.bin",
+                                                   dump_dir, env_seq);
+            FILE *f = fopen (p, "wb");
+            if (f) { fwrite (gap, 2, N, f); fclose (f); }
+            g_free (gap);
+        }
+    }
+
     gm168_local_stretch  (smoothed, low_h, high_h, out);
 
     g_free (src);
