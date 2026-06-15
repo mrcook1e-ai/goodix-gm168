@@ -2071,29 +2071,43 @@ capture_completed (FpiSsm *ssm, FpDevice *dev, GError *error)
          * dropped in Stage B cleanup. */
         gm168_envelope_stretch (raw16, self->background, fp_img->data);
 
-#ifdef GM168_DEBUG
+        /* Diagnostic frame dump (raw16 / bg16 / final 8-bit) used by
+         * scripts/single_touch.sh.  Triggered by either the compile-time
+         * GM168_DEBUG flag (always-on debug build) or the runtime
+         * GM168_DUMP_FRAMES env var (zero cost when unset).  The target
+         * directory is GM168_DUMP_DIR if set, otherwise /tmp.            */
         {
-            static int dbg_seq = 0;
-            dbg_seq++;
-            char path[128];
-            snprintf (path, sizeof (path), "/tmp/gm168_%03d_raw16.bin", dbg_seq);
-            FILE *f1 = fopen (path, "wb");
-            if (f1) { fwrite (raw16, 2, GM168_FRAME_PIXELS, f1); fclose (f1); }
-            if (self->background) {
-                snprintf (path, sizeof (path), "/tmp/gm168_%03d_bg16.bin", dbg_seq);
-                FILE *f2 = fopen (path, "wb");
-                if (f2) { fwrite (self->background, 2, GM168_FRAME_PIXELS, f2); fclose (f2); }
+            const gchar *dump_dir = NULL;
+#ifdef GM168_DEBUG
+            dump_dir = g_getenv ("GM168_DUMP_DIR");
+            if (!dump_dir) dump_dir = "/tmp";
+#else
+            if (g_getenv ("GM168_DUMP_FRAMES")) {
+                dump_dir = g_getenv ("GM168_DUMP_DIR");
+                if (!dump_dir) dump_dir = "/tmp";
             }
-            snprintf (path, sizeof (path), "/tmp/gm168_%03d_fpimg.pgm", dbg_seq);
-            FILE *f4 = fopen (path, "wb");
-            if (f4) {
-                fprintf (f4, "P5\n%d %d\n255\n", GM168_FRAME_W, GM168_FRAME_H);
-                fwrite (fp_img->data, 1, GM168_FRAME_PIXELS, f4);
-                fclose (f4);
-            }
-            fp_warn ("DEBUG: dumped seq=%d to /tmp/gm168_%03d_*", dbg_seq, dbg_seq);
-        }
 #endif
+            if (dump_dir) {
+                static int dbg_seq = 0;
+                dbg_seq++;
+                g_autofree gchar *p_raw = g_strdup_printf ("%s/gm168_%03d_raw16.bin", dump_dir, dbg_seq);
+                FILE *f1 = fopen (p_raw, "wb");
+                if (f1) { fwrite (raw16, 2, GM168_FRAME_PIXELS, f1); fclose (f1); }
+                if (self->background) {
+                    g_autofree gchar *p_bg = g_strdup_printf ("%s/gm168_%03d_bg16.bin", dump_dir, dbg_seq);
+                    FILE *f2 = fopen (p_bg, "wb");
+                    if (f2) { fwrite (self->background, 2, GM168_FRAME_PIXELS, f2); fclose (f2); }
+                }
+                g_autofree gchar *p_pgm = g_strdup_printf ("%s/gm168_%03d_fpimg.pgm", dump_dir, dbg_seq);
+                FILE *f4 = fopen (p_pgm, "wb");
+                if (f4) {
+                    fprintf (f4, "P5\n%d %d\n255\n", GM168_FRAME_W, GM168_FRAME_H);
+                    fwrite (fp_img->data, 1, GM168_FRAME_PIXELS, f4);
+                    fclose (f4);
+                }
+                fp_warn ("frame dump: seq=%d → %s/gm168_%03d_*", dbg_seq, dump_dir, dbg_seq);
+            }
+        }
         g_free (raw16);
 
         /* ── Quality-gate (Windows-style retry-until-good) ──────────────
