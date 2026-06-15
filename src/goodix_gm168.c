@@ -671,21 +671,35 @@ gm168_morph_close_x5 (const guint16 *low_in, const guint16 *high_in,
 /* Stage 6 — Per-pixel normalisation + invert to NBIS polarity.
  *   v   = (signal - C) * 255 / (A - C)
  *   out = 0xff - clamp(v, 0, 255)
- * On collapsed envelopes (A <= C, happens in high-pressure saturated areas
- * where the 11px window sits entirely on one ridge or in a uniform valley)
- * we output 0x80 — neutral, so NBIS still has something. Windows raises a
- * weak-pixel flag here but doesn't modify the image either. */
+ *
+ * Two cases get the neutral 0x80 instead of normalising:
+ *
+ * 1. A <= C (collapsed envelope) — happens in high-pressure saturated
+ *    areas where the 11px window sits entirely on one ridge or in a
+ *    uniform valley. Always masked.
+ *
+ * 2. A - C below GM168_WEAK_GAP env threshold — weak-signal zones,
+ *    typically the empty corners where no finger is touching.  Without
+ *    this mask the stretch happily normalises pure ADC noise into
+ *    confident-looking fake ridges, which feeds bogus minutiae into
+ *    NBIS and tanks verify accuracy.  Windows Wbdi flags but doesn't
+ *    modify here — for our smaller sensor area, masking helps NBIS
+ *    ignore the noise.  Default 0 = legacy behaviour (no masking);
+ *    try 400-800 to see effect.  Units are 12-bit envelope counts.   */
 static void
 gm168_local_stretch (const guint16 *signal,
                      const guint16 *low, const guint16 *high,
                      guint8 *out)
 {
     const int N = GM168_FRAME_PIXELS;
+    const gchar *env = g_getenv ("GM168_WEAK_GAP");
+    const gint32 weak_gap = env ? atoi (env) : 0;
+
     for (int i = 0; i < N; i++) {
         gint32 A = high[i];
         gint32 C = low[i];
         gint32 denom = A - C;
-        if (denom <= 0) {
+        if (denom <= weak_gap) {
             out[i] = 0x80;
         } else {
             gint32 v = ((gint32) signal[i] - C) * 255 / denom;

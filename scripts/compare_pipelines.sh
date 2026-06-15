@@ -18,6 +18,7 @@
 # Usage:
 #   ./scripts/compare_pipelines.sh
 #   ./scripts/compare_pipelines.sh --variants baseline,cal2
+#   ./scripts/compare_pipelines.sh --sweep weak    # GM168_WEAK_GAP sweep
 #   ./scripts/compare_pipelines.sh --keep
 #
 # Output:
@@ -42,11 +43,24 @@ ALL_VARIANTS=(
     "wallis|GM168_USE_WALLIS=1"
 )
 
+# Sweep mode: same pipeline (cal2_median, currently the cleanest baseline)
+# but vary the weak-signal mask threshold — find a value that wipes the
+# noise-amplified fake ridges in the empty corners without eating real
+# ridge edges.  Units are 12-bit envelope counts (A - C).
+WEAK_VARIANTS=(
+    "weak000|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_WEAK_GAP=0"
+    "weak200|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_WEAK_GAP=200"
+    "weak400|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_WEAK_GAP=400"
+    "weak800|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_WEAK_GAP=800"
+)
+
 WANTED=""
+SWEEP=""
 KEEP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variants) WANTED="$2"; shift 2 ;;
+        --sweep)    SWEEP="$2"; shift 2 ;;
         --keep)     KEEP=1; shift ;;
         --help|-h)
             sed -n '2,/^set -euo/p' "$0" | sed -E 's/^# ?//; /^set -euo/d'
@@ -55,6 +69,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+# --sweep weak  → use the WEAK_GAP threshold table instead of the pipeline table.
+if [[ "$SWEEP" == "weak" ]]; then
+    ALL_VARIANTS=("${WEAK_VARIANTS[@]}")
+fi
 
 # Filter variants if --variants was given
 if [[ -n "$WANTED" ]]; then
