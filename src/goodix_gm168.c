@@ -668,6 +668,60 @@ gm168_morph_close_x5 (const guint16 *low_in, const guint16 *high_in,
     }
 }
 
+/* Stage 0b — Finger-presence mask (Wbdi `sub_18010a460`'s `arg4+0x10`).
+ *
+ * For each pixel, average |raw - bg| over a 7x7 neighbourhood; if the
+ * local signal strength is above GM168_MASK_THRESH (default 200 in
+ * 12-bit ADC units), the pixel is "touched", otherwise "empty".
+ *
+ * The mask is consumed by `local_stretch` which only normalises
+ * touched pixels — empty regions stay at the neutral init value (0x80)
+ * and don't generate fake ridges that confuse NBIS MINDTCT.
+ *
+ * Without this gate our `local_stretch` reproduces Wbdi math but
+ * stretches ADC noise everywhere; MINDTCT then either fails minutiae
+ * extraction (~36 % of our captures in the wild) or invents bogus
+ * minutiae in pure-noise zones which tank verify accuracy.
+ *
+ * If `bg` is NULL (very early init, no calibration done yet), the
+ * mask is set to "all touched" — caller falls back to the legacy
+ * stretch-everywhere behaviour. */
+static void
+gm168_finger_mask (const guint16 *raw, const guint16 *bg, guint8 *mask)
+{
+    const int W = GM168_FRAME_W;
+    const int H = GM168_FRAME_H;
+    const int R = 3;  /* 7x7 window */
+
+    const gchar *env = g_getenv ("GM168_MASK_THRESH");
+    const int thresh = env ? atoi (env) : 200;
+
+    if (!bg) {
+        memset (mask, 0xFF, (size_t) W * H);
+        return;
+    }
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int sum = 0, count = 0;
+            for (int dy = -R; dy <= R; dy++) {
+                int ny = y + dy;
+                if (ny < 0 || ny >= H) continue;
+                for (int dx = -R; dx <= R; dx++) {
+                    int nx = x + dx;
+                    if (nx < 0 || nx >= W) continue;
+                    int d = (int) raw[ny * W + nx] - (int) bg[ny * W + nx];
+                    if (d < 0) d = -d;
+                    sum += d;
+                    count++;
+                }
+            }
+            int avg = count ? sum / count : 0;
+            mask[y * W + x] = (avg > thresh) ? 0xFF : 0;
+        }
+    }
+}
+
 /* Stage 6 — Per-pixel normalisation + invert to NBIS polarity.
  *   v   = (signal - C) * 255 / (A - C)
  *   out = 0xff - clamp(v, 0, 255)
@@ -689,6 +743,7 @@ gm168_morph_close_x5 (const guint16 *low_in, const guint16 *high_in,
 static void
 gm168_local_stretch (const guint16 *signal,
                      const guint16 *low, const guint16 *high,
+                     const guint8 *mask,
                      guint8 *out)
 {
     const int N = GM168_FRAME_PIXELS;
@@ -696,6 +751,13 @@ gm168_local_stretch (const guint16 *signal,
     const gint32 weak_gap = env ? atoi (env) : 0;
 
     for (int i = 0; i < N; i++) {
+        if (mask && mask[i] == 0) {
+            /* Empty zone — leave at neutral so NBIS MINDTCT sees a
+             * flat featureless area and doesn't try to find ridges
+             * in pure ADC noise. */
+            out[i] = 0x80;
+            continue;
+        }
         gint32 A = high[i];
         gint32 C = low[i];
         gint32 denom = A - C;
@@ -754,10 +816,17 @@ gm168_envelope_stretch (const guint16 *raw, const guint16 *bg, guint8 *out)
     gm168_envelope_combine (low_h, high_h, low_v, high_v);
     gm168_morph_close_x5 (low_v, high_v, low_h, high_h);
 
-    /* Diagnostic: dump the per-pixel envelope gap (high - low) so the
-     * single_touch renderer can show where local_stretch would amplify
-     * noise (small gap = candidate for GM168_WEAK_GAP masking).  Same
-     * gate as the frame dumps in capture_completed. */
+    /* Finger mask — gated by GM168_FINGER_MASK env, NULL = legacy path */
+    guint8 *fmask = NULL;
+    if (g_getenv ("GM168_FINGER_MASK")) {
+        fmask = g_new0 (guint8, N);
+        gm168_finger_mask (raw, bg, fmask);
+    }
+
+    /* Diagnostic: dump the per-pixel envelope gap (high - low) and the
+     * finger mask so the single_touch renderer can show where the
+     * pipeline is masking noise vs amplifying signal.  Same gate as
+     * the frame dumps in capture_completed. */
     {
         const gchar *dump_dir = NULL;
 #ifdef GM168_DEBUG
@@ -779,15 +848,22 @@ gm168_envelope_stretch (const guint16 *raw, const guint16 *bg, guint8 *out)
                 if (d > 0xFFFF) d = 0xFFFF;
                 gap[i] = (guint16) d;
             }
-            g_autofree gchar *p = g_strdup_printf ("%s/gm168_%03d_envgap.bin",
-                                                   dump_dir, env_seq);
-            FILE *f = fopen (p, "wb");
+            g_autofree gchar *p_gap = g_strdup_printf ("%s/gm168_%03d_envgap.bin",
+                                                       dump_dir, env_seq);
+            FILE *f = fopen (p_gap, "wb");
             if (f) { fwrite (gap, 2, N, f); fclose (f); }
             g_free (gap);
+
+            if (fmask) {
+                g_autofree gchar *p_mask = g_strdup_printf ("%s/gm168_%03d_fmask.bin",
+                                                            dump_dir, env_seq);
+                FILE *fm = fopen (p_mask, "wb");
+                if (fm) { fwrite (fmask, 1, N, fm); fclose (fm); }
+            }
         }
     }
 
-    gm168_local_stretch  (smoothed, low_h, high_h, out);
+    gm168_local_stretch  (smoothed, low_h, high_h, fmask, out);
 
     g_free (src);
     g_free (smoothed);
@@ -795,6 +871,7 @@ gm168_envelope_stretch (const guint16 *raw, const guint16 *bg, guint8 *out)
     g_free (high_h);
     g_free (low_v);
     g_free (high_v);
+    g_clear_pointer (&fmask, g_free);
 }
 
 static int

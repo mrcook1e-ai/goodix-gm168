@@ -19,6 +19,7 @@
 #   ./scripts/compare_pipelines.sh
 #   ./scripts/compare_pipelines.sh --variants baseline,cal2
 #   ./scripts/compare_pipelines.sh --sweep weak    # GM168_WEAK_GAP sweep
+#   ./scripts/compare_pipelines.sh --sweep mask    # GM168_FINGER_MASK sweep
 #   ./scripts/compare_pipelines.sh --keep
 #
 # Output:
@@ -54,6 +55,18 @@ WEAK_VARIANTS=(
     "weak080|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_WEAK_GAP=80"
 )
 
+# Sweep mode: same base pipeline + finger-detection mask at different
+# threshold values.  This is the Wbdi-inspired path — gate the local
+# stretch to only fire on touched pixels, leaving empty zones at 0x80
+# so MINDTCT doesn't see noise-amplified fake ridges.
+# Threshold is in 12-bit ADC counts of mean |raw - bg| over a 7x7 window.
+MASK_VARIANTS=(
+    "mask_off|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1"
+    "mask100|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_FINGER_MASK=1 GM168_MASK_THRESH=100"
+    "mask200|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_FINGER_MASK=1 GM168_MASK_THRESH=200"
+    "mask400|GM168_USE_CAL2=1 GM168_USE_MEDIAN=1 GM168_FINGER_MASK=1 GM168_MASK_THRESH=400"
+)
+
 WANTED=""
 SWEEP=""
 KEEP=0
@@ -71,9 +84,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --sweep weak  → use the WEAK_GAP threshold table instead of the pipeline table.
-if [[ "$SWEEP" == "weak" ]]; then
-    ALL_VARIANTS=("${WEAK_VARIANTS[@]}")
-fi
+# --sweep mask  → use the finger-mask threshold table.
+case "$SWEEP" in
+    weak) ALL_VARIANTS=("${WEAK_VARIANTS[@]}") ;;
+    mask) ALL_VARIANTS=("${MASK_VARIANTS[@]}") ;;
+esac
 
 # Filter variants if --variants was given
 if [[ -n "$WANTED" ]]; then

@@ -28,8 +28,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -114,6 +117,41 @@ def normalize_signed_to_8bit(values: List[int]) -> List[int]:
     if span == 0:
         return [128] * len(values)
     return [int(128 + v * 127 / span) for v in values]
+
+
+# ---------------------------------------------------------------------------
+# mindtct integration — direct NBIS minutiae count
+
+_mindtct_path: Optional[str] = None
+_mindtct_checked = False
+
+
+def run_mindtct(pgm_path: Path) -> Optional[int]:
+    """Run mindtct on a PGM and return the minutiae count, or None if
+    mindtct is not installed."""
+    global _mindtct_path, _mindtct_checked
+    if not _mindtct_checked:
+        _mindtct_path = shutil.which("mindtct")
+        _mindtct_checked = True
+        if not _mindtct_path:
+            print("[single_touch] mindtct not on PATH — install nbis-bin "
+                  "(or libfprint-tools) to get minutiae counts", file=sys.stderr)
+    if not _mindtct_path:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        prefix = Path(td) / "out"
+        try:
+            subprocess.run(
+                [_mindtct_path, str(pgm_path), str(prefix)],
+                check=True, capture_output=True, timeout=10,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        xyt = prefix.with_suffix(".xyt")
+        if not xyt.exists():
+            return None
+        # Each minutia is one line: "X Y THETA QUALITY"
+        return sum(1 for line in xyt.read_text().splitlines() if line.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +256,18 @@ def main() -> None:
         envgap_path = candidates[-1] if candidates else None
     envgap: Optional[List[int]] = read_raw16(envgap_path) if envgap_path and envgap_path.exists() else None
 
+    # finger mask (only dumped when GM168_FINGER_MASK was active)
+    fmask_path = in_dir / f"gm168_{seq:03d}_fmask.bin"
+    if not fmask_path.exists():
+        candidates = sorted(in_dir.glob("gm168_*_fmask.bin"))
+        fmask_path = candidates[-1] if candidates else None
+    fmask: Optional[List[int]] = None
+    if fmask_path and fmask_path.exists():
+        fmask = list(fmask_path.read_bytes())
+
+    # mindtct minutiae count on the FINAL pgm — direct NBIS feedback
+    mindtct_n: Optional[int] = run_mindtct(pgm_path)
+
     tiles = []
 
     raw_st = stats(raw16)
@@ -235,7 +285,18 @@ def main() -> None:
         tiles.append(("RAW − BG", diff_st, saturation_8bit(diff8), diff8))
 
     final_st = stats(final8)
-    tiles.append(("FINAL (envelope→8b)", final_st, saturation_8bit(final8), final8))
+    final_label = "FINAL (envelope→8b)"
+    if mindtct_n is not None:
+        final_label = f"FINAL  ·  minutiae:{mindtct_n}"
+    tiles.append((final_label, final_st, saturation_8bit(final8), final8))
+
+    if fmask is not None:
+        mask_st = stats(fmask)
+        mask_covered = sum(1 for v in fmask if v > 0) / len(fmask)
+        mask_st["p10"] = 0   # repurpose the percentile slots for coverage info
+        mask_st["p50"] = int(mask_covered * 100)
+        mask_st["p90"] = 100
+        tiles.append(("FINGER MASK", mask_st, 0.0, fmask))
 
     if envgap is not None:
         gap_st = stats(envgap)
@@ -266,6 +327,12 @@ def main() -> None:
     raw_clip_hi = sum(1 for v in raw16 if v >= 4091) / len(raw16)
     print(f"[single_touch] raw clipping: lo={raw_clip_lo*100:.1f}%  hi={raw_clip_hi*100:.1f}%")
     print(f"[single_touch] final std={final_st['std']:.1f}  sat={saturation_8bit(final8)*100:.1f}%")
+    if mindtct_n is not None:
+        verdict = "✓ NBIS-ok" if mindtct_n >= 8 else ("⚠ marginal" if mindtct_n >= 4 else "✗ too few")
+        print(f"[single_touch] mindtct minutiae: {mindtct_n}  {verdict}")
+    if fmask is not None:
+        covered = sum(1 for v in fmask if v > 0) / len(fmask) * 100
+        print(f"[single_touch] finger-mask coverage: {covered:.1f}%")
 
 
 if __name__ == "__main__":
